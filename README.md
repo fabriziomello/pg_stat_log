@@ -35,15 +35,15 @@ The extension uses custom stats kind ID **28**, registered on the
 Build and install using PGXS:
 
 ```bash
-make USE_PGXS=1
-make install USE_PGXS=1
+make
+make install
 ```
 
 If the build cannot locate `errcodes.txt` automatically, point it to the
 PostgreSQL source tree:
 
 ```bash
-make USE_PGXS=1 ERRCODES_FILE=/path/to/postgresql/src/backend/utils/errcodes.txt
+make ERRCODES_FILE=/path/to/postgresql/src/backend/utils/errcodes.txt
 ```
 
 Then configure PostgreSQL to load the extension:
