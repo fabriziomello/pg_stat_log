@@ -7,8 +7,7 @@ OBJS = pg_stat_log.o
 
 TAP_TESTS = 1
 
-ERRCODES_TXT = $(shell $(PG_CONFIG) --includedir-server)/../../src/backend/utils/errcodes.txt
-ERRCODES_TXT_ALT = $(shell $(PG_CONFIG) --includedir-server)/../../../src/backend/utils/errcodes.txt
+ERRCODES_TXT = $(shell $(PG_CONFIG) --sharedir)/errcodes.txt
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
@@ -28,8 +27,6 @@ pg_stat_log_errcodes.h: generate-errcode-names.pl
 		$(PERL) $< --outfile $@ $(ERRCODES_FILE); \
 	elif [ -f "$(ERRCODES_TXT)" ]; then \
 		$(PERL) $< --outfile $@ $(ERRCODES_TXT); \
-	elif [ -f "$(ERRCODES_TXT_ALT)" ]; then \
-		$(PERL) $< --outfile $@ $(ERRCODES_TXT_ALT); \
 	else \
 		echo "ERROR: cannot find errcodes.txt; set ERRCODES_FILE=/path/to/errcodes.txt" >&2; \
 		exit 1; \
