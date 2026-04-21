@@ -1,0 +1,4 @@
+comment = 'cumulative statistics about log messages'
+default_version = '1.0'
+module_pathname = '$libdir/pg_stat_log'
+relocatable = true
