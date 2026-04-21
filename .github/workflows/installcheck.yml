@@ -19,4 +19,6 @@ jobs:
       - name: Start PostgreSQL ${{ matrix.pg }}
         run: pg-start ${{ matrix.pg }}
       - name: Build and test
-        run: pg-build-test
+        run: |
+          chown -R postgres:postgres .
+          gosu postgres pg-build-test
