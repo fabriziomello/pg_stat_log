@@ -1,5 +1,7 @@
 # pg_stat_log
 
+[![CI](https://github.com/fabriziomello/pg_stat_log/actions/workflows/installcheck.yml/badge.svg)](https://github.com/fabriziomello/pg_stat_log/actions/workflows/installcheck.yml)
+
 Cumulative statistics about PostgreSQL log messages, built on the
 [Custom Cumulative Stats](https://wiki.postgresql.org/wiki/CustomCumulativeStats)
 API introduced in PostgreSQL 18.
