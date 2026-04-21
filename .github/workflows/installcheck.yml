@@ -1,0 +1,11 @@
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: pgxn/pgxn-tools
+    strategy:
+      matrix:
+        pg: [17, 18]
+    steps:
+      - checkout: actions/checkout@v6
+      - run: pg-start ${{ matrix.pg }}
+      - run: pg-build-test
