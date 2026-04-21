@@ -33,3 +33,5 @@ lib*.pc
 /tmp_check/
 /log/
 /.idea/
+pg_stat_log_errcodes.h
+
