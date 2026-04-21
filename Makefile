@@ -7,18 +7,11 @@ OBJS = pg_stat_log.o
 
 TAP_TESTS = 1
 
-ERRCODES_TXT = $(shell $(PG_CONFIG) --sharedir)/errcodes.txt
-
-ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
-else
-subdir = contrib/pg_stat_log
-top_builddir = ../..
-include $(top_builddir)/src/Makefile.global
-include $(top_srcdir)/contrib/contrib-global.mk
-endif
+
+ERRCODES_TXT = $(shell $(PG_CONFIG) --sharedir)/errcodes.txt
 
 # Generate the errcode-name lookup header from errcodes.txt.
 # Try the standard source tree location first, fall back to alternate.
