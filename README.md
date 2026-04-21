@@ -2,7 +2,7 @@
 
 Cumulative statistics about PostgreSQL log messages, built on the
 [Custom Cumulative Stats](https://wiki.postgresql.org/wiki/CustomCumulativeStats)
-API introduced in PostgreSQL 17.
+API introduced in PostgreSQL 18.
 
 ## Overview
 
@@ -25,7 +25,7 @@ The extension uses custom stats kind ID **28**, registered on the
 
 ## Requirements
 
-- PostgreSQL 17 or later
+- PostgreSQL 18 or later
 - Must be loaded via `shared_preload_libraries`
 
 ## Installation
