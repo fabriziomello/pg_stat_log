@@ -34,3 +34,12 @@ SELECT s.backend_type,
 FROM pg_stat_log_data() s
 LEFT JOIN pg_database d ON d.oid = s.database_oid
 LEFT JOIN pg_roles u ON u.oid = s.user_oid;
+
+REVOKE ALL ON FUNCTION pg_stat_log_reset() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_stat_log_reset() TO pg_monitor;
+
+REVOKE ALL ON FUNCTION pg_stat_log_data() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_stat_log_data() TO pg_read_all_stats;
+
+REVOKE ALL ON pg_stat_log FROM PUBLIC;
+GRANT SELECT ON pg_stat_log TO pg_read_all_stats;
