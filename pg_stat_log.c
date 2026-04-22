@@ -226,9 +226,10 @@ static void
 pg_stat_log_emit_hook(ErrorData *edata)
 {
 	PgStatLogShared *shmem;
-	PgStatLog *s;
+	PgStatLog  *s;
 	Oid			dboid;
 	Oid			userid;
+	bool		lock_held = false;
 	int			i;
 
 	if (prev_emit_log_hook)
@@ -242,71 +243,73 @@ pg_stat_log_emit_hook(ErrorData *edata)
 
 	if (in_emit_log_hook)
 		return;
-	in_emit_log_hook = true;
 
 	/*
 	 * pgstat shared memory might not be set up yet during early startup or
 	 * in auxiliary processes before attachment.
 	 */
 	if ((!IsUnderPostmaster && IsPostmasterEnvironment) || !MyProc)
-	{
-		in_emit_log_hook = false;
 		return;
-	}
 
-	shmem = (PgStatLogShared *)
-		pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
-
-	dboid = MyDatabaseId;
-
+	in_emit_log_hook = true;
+	PG_TRY();
 	{
-		int		sec_context;
+		shmem = (PgStatLogShared *)
+			pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
 
-		GetUserIdAndSecContext(&userid, &sec_context);
-	}
+		dboid = MyDatabaseId;
 
-	LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
+		{
+			int		sec_context;
 
-	s = pg_stat_log_get_stats(shmem);
+			GetUserIdAndSecContext(&userid, &sec_context);
+		}
 
-	/* Scan existing entries for a match */
-	for (i = 0; i < s->num_entries; i++)
-	{
-		if (s->entries[i].used &&
-			s->entries[i].elevel == edata->elevel &&
-			s->entries[i].sqlerrcode == edata->sqlerrcode &&
-			s->entries[i].dboid == dboid &&
-			s->entries[i].userid == userid &&
-			s->entries[i].backend_type == MyBackendType)
+		LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
+		lock_held = true;
+
+		s = pg_stat_log_get_stats(shmem);
+
+		/* Scan existing entries for a match */
+		for (i = 0; i < s->num_entries; i++)
+		{
+			if (s->entries[i].used &&
+				s->entries[i].elevel == edata->elevel &&
+				s->entries[i].sqlerrcode == edata->sqlerrcode &&
+				s->entries[i].dboid == dboid &&
+				s->entries[i].userid == userid &&
+				s->entries[i].backend_type == MyBackendType)
+			{
+				pgstat_begin_changecount_write(&shmem->changecount);
+				s->entries[i].count++;
+				pgstat_end_changecount_write(&shmem->changecount);
+				break;
+			}
+		}
+
+		/* Not found — create new entry if space available */
+		if (i == s->num_entries && s->num_entries < s->max_entries)
 		{
 			pgstat_begin_changecount_write(&shmem->changecount);
-			s->entries[i].count++;
+			s->entries[s->num_entries].used = true;
+			s->entries[s->num_entries].elevel = edata->elevel;
+			s->entries[s->num_entries].sqlerrcode = edata->sqlerrcode;
+			s->entries[s->num_entries].dboid = dboid;
+			s->entries[s->num_entries].userid = userid;
+			s->entries[s->num_entries].backend_type = MyBackendType;
+			s->entries[s->num_entries].count = 1;
+			s->num_entries++;
 			pgstat_end_changecount_write(&shmem->changecount);
-
-			LWLockRelease(&shmem->lock);
-			in_emit_log_hook = false;
-			return;
 		}
+		/* else: silently drop when full */
 	}
-
-	/* Not found — create new entry if space available */
-	if (s->num_entries < s->max_entries)
+	PG_FINALLY();
 	{
-		pgstat_begin_changecount_write(&shmem->changecount);
-		s->entries[s->num_entries].used = true;
-		s->entries[s->num_entries].elevel = edata->elevel;
-		s->entries[s->num_entries].sqlerrcode = edata->sqlerrcode;
-		s->entries[s->num_entries].dboid = dboid;
-		s->entries[s->num_entries].userid = userid;
-		s->entries[s->num_entries].backend_type = MyBackendType;
-		s->entries[s->num_entries].count = 1;
-		s->num_entries++;
-		pgstat_end_changecount_write(&shmem->changecount);
+		if (lock_held)
+			LWLockRelease(&shmem->lock);
+		in_emit_log_hook = false;
 	}
-	/* else: silently drop when full */
-
-	LWLockRelease(&shmem->lock);
-	in_emit_log_hook = false;
+	PG_END_TRY();
 }
 
 #if PG_VERSION_NUM < 190000
