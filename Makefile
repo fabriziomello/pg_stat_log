@@ -5,6 +5,9 @@ DATA = pg_stat_log--1.0.sql
 
 OBJS = pg_stat_log.o
 
+REGRESS_OPTS = --temp-instance=tmp_check --temp-config=pg_stat_log.conf
+REGRESS = pg_stat_log
+
 TAP_TESTS = 1
 
 PG_CONFIG = pg_config
