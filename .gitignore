@@ -34,4 +34,6 @@ lib*.pc
 /log/
 /.idea/
 pg_stat_log_errcodes.h
+typedefs.list
+*.dSYM/
 

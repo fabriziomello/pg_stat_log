@@ -30,6 +30,24 @@ pg_stat_log_errcodes.h: generate-errcode-names.pl
 
 pg_stat_log.o: pg_stat_log_errcodes.h
 
-clean: clean-errcodes
+format:
+	@if [ "$$(uname)" = "Darwin" ]; then \
+		dsymutil pg_stat_log.dylib; \
+		dwarfdump pg_stat_log.dylib.dSYM | grep -A2 DW_TAG_typedef | \
+		grep DW_AT_name | sed 's/.*("\(.*\)")/\1/' | sort -u > typedefs.list; \
+	else \
+		objdump -W pg_stat_log.so | egrep -A3 DW_TAG_typedef | \
+		perl -e 'while (<>) { chomp; @flds = split; next unless (1 < @flds); \
+		next if $$flds[0] ne "DW_AT_name" && $$flds[1] ne "DW_AT_name"; \
+		next if $$flds[-1] =~ /^DW_FORM_str/; print $$flds[-1],"\n"; }' | \
+		sort -u > typedefs.list; \
+	fi
+	pgindent --typedefs=typedefs.list pg_stat_log.c
+
+clean: clean-errcodes clean-typedefs clean-dsym
 clean-errcodes:
 	rm -f pg_stat_log_errcodes.h
+clean-typedefs:
+	rm -f typedefs.list
+clean-dsym:
+	rm -rf pg_stat_log.dylib.dSYM
