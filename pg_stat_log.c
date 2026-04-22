@@ -312,6 +312,13 @@ pg_stat_log_emit_hook(ErrorData *edata)
 	PG_END_TRY();
 }
 
+/*
+ * server_message_level_options was introduced in commit
+ * https://github.com/postgres/postgres/commit/0a20ff54f5e6
+ * but only exported for use by extensions in
+ * https://github.com/postgres/postgres/commit/38e0190ced71,
+ * which will ship in PostgreSQL 19.
+ */
 #if PG_VERSION_NUM < 190000
 static const struct config_enum_entry server_message_level_options[] = {
 	{"debug5", DEBUG5, false},
