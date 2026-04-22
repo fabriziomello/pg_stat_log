@@ -22,6 +22,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/ipc.h"
 #include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/errcodes.h"
@@ -98,8 +99,19 @@ static int	pg_stat_log_max = PGSTAT_LOG_DEFAULT_MAX;
 static Size stats_block_size;	/* one PgStatLog block */
 
 /*
+ * LWLock tranche ID for the extension's lock. Allocated via
+ * LWLockNewTrancheId() in pg_stat_log_init_shmem_cb (which runs in the
+ * postmaster after shared memory is set up) and registered per-process via
+ * LWLockRegisterTranche() so that wait events show up distinctly as
+ * "pg_stat_log" in pg_stat_activity / pg_wait_events instead of being
+ * conflated with core pgstats locks.
+ */
+static int	pg_stat_log_tranche_id = 0;
+
+/*
  * Hook state
  */
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static emit_log_hook_type prev_emit_log_hook = NULL;
 static bool in_emit_log_hook = false;
 
@@ -143,6 +155,10 @@ static PgStat_KindInfo log_stats_kind;
 
 /*
  * init_shmem_cb — initialize shared memory
+ *
+ * Only runs in the postmaster (see StatsShmemInit), after the main LWLock
+ * array has been set up. This is the first place it is safe to call
+ * LWLockNewTrancheId(), which needs shared memory to exist.
  */
 static void
 pg_stat_log_init_shmem_cb(void *stats)
@@ -150,11 +166,35 @@ pg_stat_log_init_shmem_cb(void *stats)
 	PgStatLogShared *shmem = (PgStatLogShared *) stats;
 	PgStatLog *s;
 
-	LWLockInitialize(&shmem->lock, LWTRANCHE_PGSTATS_DATA);
+	pg_stat_log_tranche_id = LWLockNewTrancheId();
+	LWLockInitialize(&shmem->lock, pg_stat_log_tranche_id);
 
 	s = pg_stat_log_get_stats(shmem);
 	s->max_entries = pg_stat_log_max;
 	s->num_entries = 0;
+}
+
+/*
+ * shmem_startup_hook — register the tranche name in every process.
+ *
+ * On fork-based platforms backends inherit the tranche ID and the
+ * registration from the postmaster, but under EXEC_BACKEND each child has
+ * to re-register, so do it unconditionally here. The tranche ID is read
+ * from shared memory (initialized by the init_shmem_cb above).
+ */
+static void
+pg_stat_log_shmem_startup(void)
+{
+	PgStatLogShared *shmem;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	shmem = (PgStatLogShared *)
+		pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
+
+	pg_stat_log_tranche_id = shmem->lock.tranche;
+	LWLockRegisterTranche(pg_stat_log_tranche_id, "pg_stat_log");
 }
 
 /*
@@ -411,6 +451,13 @@ _PG_init(void)
 	}
 
 	pgstat_register_kind(PGSTAT_KIND_LOG, &log_stats_kind);
+
+	/*
+	 * Install shmem_startup_hook so every process registers the LWLock
+	 * tranche name (needed for EXEC_BACKEND; harmless on fork).
+	 */
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = pg_stat_log_shmem_startup;
 
 	/* Install emit_log_hook */
 	prev_emit_log_hook = emit_log_hook;
