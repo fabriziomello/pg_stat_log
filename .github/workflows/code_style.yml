@@ -1,0 +1,31 @@
+name: Code style
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.c'
+      - '**.h'
+      - '.clang-format'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.c'
+      - '**.h'
+      - '.clang-format'
+jobs:
+  clang-format:
+    name: Check code formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Check trailing whitespace
+        if: always()
+        run: |
+          find . -type f -regex '.*\.\(c\|h\)$' -exec perl -pi -e 's/[ \t]+$//' {} +
+          git diff --exit-code
+      - name: Check code formatting
+        if: always()
+        run: |
+          clang-format -i pg_stat_log.c
+          git diff --exit-code
