@@ -22,6 +22,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "common/hashfn.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "utils/builtins.h"
@@ -142,6 +143,23 @@ pg_stat_log_errcode_name(int sqlerrcode)
 }
 
 /*
+ * Hash function for slot lookup — combines all key fields into a uint32
+ * for open-addressing into the entries array.
+ */
+static inline uint32
+pg_stat_log_hash_key(BackendType backend_type, Oid dboid, Oid userid, int elevel, int sqlerrcode)
+{
+    uint32 h;
+
+    h = murmurhash32((uint32) backend_type);
+    h = hash_combine(h, murmurhash32((uint32) dboid));
+    h = hash_combine(h, murmurhash32((uint32) userid));
+    h = hash_combine(h, murmurhash32((uint32) elevel));
+    h = hash_combine(h, murmurhash32((uint32) sqlerrcode));
+    return h;
+}
+
+/*
  * PgStat_KindInfo — filled dynamically in _PG_init
  */
 static void pg_stat_log_init_shmem_cb(void *stats);
@@ -243,9 +261,9 @@ pg_stat_log_snapshot_cb(void)
     LWLockRelease(&shmem->lock);
 
     /* Apply reset offsets — same as FIXED_COMP in test module */
-    for (i = 0; i < snap->num_entries; i++)
+    for (i = 0; i < snap->max_entries; i++)
     {
-        if (snap->entries[i].used && i < reset_local->num_entries && reset_local->entries[i].used)
+        if (snap->entries[i].used && reset_local->entries[i].used)
             snap->entries[i].count -= reset_local->entries[i].count;
     }
 
@@ -263,7 +281,6 @@ pg_stat_log_emit_hook(ErrorData *edata)
     Oid              dboid;
     Oid              userid;
     bool             lock_held = false;
-    int              i;
 
     if (prev_emit_log_hook)
         prev_emit_log_hook(edata);
@@ -287,50 +304,61 @@ pg_stat_log_emit_hook(ErrorData *edata)
     in_emit_log_hook = true;
     PG_TRY();
     {
+        int    sec_context;
+        uint32 hash;
+        uint32 idx;
+        int    probe;
+
         shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
 
         dboid = MyDatabaseId;
-
-        {
-            int sec_context;
-
-            GetUserIdAndSecContext(&userid, &sec_context);
-        }
+        GetUserIdAndSecContext(&userid, &sec_context);
 
         LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
         lock_held = true;
 
         s = pg_stat_log_get_stats(shmem);
 
-        /* Scan existing entries for a match */
-        for (i = 0; i < s->num_entries; i++)
+        /* O(1) hash probe to find or insert entry */
+        hash = pg_stat_log_hash_key(MyBackendType, dboid, userid, edata->elevel, edata->sqlerrcode);
+        idx  = hash % s->max_entries;
+
+        for (probe = 0; probe < s->max_entries; probe++)
         {
-            if (s->entries[i].used && s->entries[i].elevel == edata->elevel &&
-                s->entries[i].sqlerrcode == edata->sqlerrcode && s->entries[i].dboid == dboid &&
-                s->entries[i].userid == userid && s->entries[i].backend_type == MyBackendType)
+            uint32         pos  = (idx + probe) % s->max_entries;
+            PgStatLogSlot *slot = &s->entries[pos];
+
+            if (!slot->used)
             {
+                /* Empty slot — insert if space available */
+                if (s->num_entries < s->max_entries)
+                {
+                    pgstat_begin_changecount_write(&shmem->changecount);
+                    slot->used         = true;
+                    slot->backend_type = MyBackendType;
+                    slot->dboid        = dboid;
+                    slot->userid       = userid;
+                    slot->elevel       = edata->elevel;
+                    slot->sqlerrcode   = edata->sqlerrcode;
+                    slot->count        = 1;
+                    s->num_entries++;
+                    pgstat_end_changecount_write(&shmem->changecount);
+                }
+                /* else: silently drop when full */
+                break;
+            }
+
+            if (slot->backend_type == MyBackendType && slot->dboid == dboid &&
+                slot->userid == userid && slot->elevel == edata->elevel &&
+                slot->sqlerrcode == edata->sqlerrcode)
+            {
+                /* Match — increment counter */
                 pgstat_begin_changecount_write(&shmem->changecount);
-                s->entries[i].count++;
+                slot->count++;
                 pgstat_end_changecount_write(&shmem->changecount);
                 break;
             }
         }
-
-        /* Not found — create new entry if space available */
-        if (i == s->num_entries && s->num_entries < s->max_entries)
-        {
-            pgstat_begin_changecount_write(&shmem->changecount);
-            s->entries[s->num_entries].used         = true;
-            s->entries[s->num_entries].elevel       = edata->elevel;
-            s->entries[s->num_entries].sqlerrcode   = edata->sqlerrcode;
-            s->entries[s->num_entries].dboid        = dboid;
-            s->entries[s->num_entries].userid       = userid;
-            s->entries[s->num_entries].backend_type = MyBackendType;
-            s->entries[s->num_entries].count        = 1;
-            s->num_entries++;
-            pgstat_end_changecount_write(&shmem->changecount);
-        }
-        /* else: silently drop when full */
     }
     PG_FINALLY();
     {
@@ -479,7 +507,7 @@ pg_stat_log_data(PG_FUNCTION_ARGS)
 
     InitMaterializedSRF(fcinfo, 0);
 
-    for (i = 0; i < snap->num_entries; i++)
+    for (i = 0; i < snap->max_entries; i++)
     {
         Datum          values[7];
         bool           nulls[7] = {0};
