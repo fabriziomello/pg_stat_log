@@ -23,7 +23,7 @@ jobs:
         pg: [18]
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Start PostgreSQL ${{ matrix.pg }}
         run: pg-start ${{ matrix.pg }}
       - name: Build and test
