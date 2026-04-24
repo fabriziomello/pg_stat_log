@@ -34,7 +34,10 @@
 
 #include "pg_stat_log_errcodes.h"
 
-PG_MODULE_MAGIC_EXT(.name = "pg_stat_log", .version = PG_VERSION);
+#define PGSTAT_MODULE_NAME  "pg_stat_log"
+#define PGSTAT_TRANCHE_NAME PGSTAT_MODULE_NAME
+
+PG_MODULE_MAGIC_EXT(.name = PGSTAT_MODULE_NAME, .version = PG_VERSION);
 
 /*
  * Custom stats kind ID — registered at
@@ -95,16 +98,6 @@ static int  pg_stat_log_max        = PGSTAT_LOG_DEFAULT_MAX;
  * Computed sizes (set in _PG_init based on pg_stat_log.max_entries)
  */
 static Size stats_block_size; /* one PgStatLog block */
-
-/*
- * LWLock tranche ID for the extension's lock. Allocated via
- * LWLockNewTrancheId() in pg_stat_log_init_shmem_cb (which runs in the
- * postmaster after shared memory is set up) and registered per-process via
- * LWLockRegisterTranche() so that wait events show up distinctly as
- * "pg_stat_log" in pg_stat_activity / pg_wait_events instead of being
- * conflated with core pgstats locks.
- */
-static int pg_stat_log_tranche_id = 0;
 
 /*
  * Hook state
@@ -181,8 +174,7 @@ pg_stat_log_init_shmem_cb(void *stats)
     PgStatLogShared *shmem = (PgStatLogShared *) stats;
     PgStatLog       *s;
 
-    pg_stat_log_tranche_id = LWLockNewTrancheId();
-    LWLockInitialize(&shmem->lock, pg_stat_log_tranche_id);
+    LWLockInitialize(&shmem->lock, LWLockNewTrancheId());
 
     s              = pg_stat_log_get_stats(shmem);
     s->max_entries = pg_stat_log_max;
@@ -207,8 +199,7 @@ pg_stat_log_shmem_startup(void)
 
     shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
 
-    pg_stat_log_tranche_id = shmem->lock.tranche;
-    LWLockRegisterTranche(pg_stat_log_tranche_id, "pg_stat_log");
+    LWLockRegisterTranche(shmem->lock.tranche, PGSTAT_TRANCHE_NAME);
 }
 
 /*
