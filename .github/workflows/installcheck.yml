@@ -20,7 +20,7 @@ jobs:
     container: pgxn/pgxn-tools
     strategy:
       matrix:
-        pg: [18]
+        pg: [18, 19]
     steps:
       - name: Check out the repo
         uses: actions/checkout@v5

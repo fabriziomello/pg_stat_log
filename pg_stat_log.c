@@ -34,10 +34,10 @@
 
 #include "pg_stat_log_errcodes.h"
 
-#define PGSTAT_MODULE_NAME  "pg_stat_log"
-#define PGSTAT_TRANCHE_NAME PGSTAT_MODULE_NAME
+#define PGSTAT_LOG_MODULE_NAME  "pg_stat_log"
+#define PGSTAT_LOG_TRANCHE_NAME PGSTAT_LOG_MODULE_NAME
 
-PG_MODULE_MAGIC_EXT(.name = PGSTAT_MODULE_NAME, .version = PG_VERSION);
+PG_MODULE_MAGIC_EXT(.name = PGSTAT_LOG_MODULE_NAME, .version = PG_VERSION);
 
 /*
  * Custom stats kind ID — registered at
@@ -174,7 +174,11 @@ pg_stat_log_init_shmem_cb(void *stats)
     PgStatLogShared *shmem = (PgStatLogShared *) stats;
     PgStatLog       *s;
 
+#if PG_VERSION_NUM < 190000
     LWLockInitialize(&shmem->lock, LWLockNewTrancheId());
+#else
+    LWLockInitialize(&shmem->lock, LWLockNewTrancheId(PGSTAT_LOG_TRANCHE_NAME));
+#endif
 
     s              = pg_stat_log_get_stats(shmem);
     s->max_entries = pg_stat_log_max;
@@ -192,14 +196,15 @@ pg_stat_log_init_shmem_cb(void *stats)
 static void
 pg_stat_log_shmem_startup(void)
 {
-    PgStatLogShared *shmem;
-
     if (prev_shmem_startup_hook)
         prev_shmem_startup_hook();
 
-    shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
-
-    LWLockRegisterTranche(shmem->lock.tranche, PGSTAT_TRANCHE_NAME);
+#if PG_VERSION_NUM < 190000
+    {
+        PgStatLogShared *shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
+        LWLockRegisterTranche(shmem->lock.tranche, PGSTAT_LOG_TRANCHE_NAME);
+    }
+#endif
 }
 
 /*
