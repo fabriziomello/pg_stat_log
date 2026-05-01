@@ -190,6 +190,40 @@ same pattern as PostgreSQL's in-tree `test_custom_fixed_stats` test module.
    from the pgstat snapshot. The `pg_stat_log` view joins its output with
    `pg_database` and `pg_roles` to resolve OIDs to names.
 
+## Caveats
+
+A few things to keep in mind when interpreting the counters:
+
+- **`emit_log_hook` only fires for messages that actually reach the server
+  log.** Lowering `pg_stat_log.min_error_level` on its own is not enough --
+  `log_min_messages` acts as a floor on what the hook ever sees. For example,
+  `pg_stat_log.min_error_level = 'notice'` requires `log_min_messages = 'notice'`
+  (or lower, e.g. `info`, `debug1`) to have any effect. With the default
+  `log_min_messages = 'warning'`, NOTICE and INFO messages are filtered out
+  before the hook runs and will not be counted.
+
+- **NULL `database_name` / `user_name` rows are expected.** A log message can
+  be emitted before a backend has bound to a database or role, so the database
+  and user OIDs may be unset. Typical cases include authentication failures
+  (e.g. FATAL with SQLSTATE `28P01`), early startup messages, and messages
+  logged in the postmaster context. This is not a bug -- those rows record
+  real events that simply have no database/user to attribute them to.
+
+- **Parallel workers appear as a separate `backend_type`.** If an error is
+  raised during a parallel query, you may see one row with
+  `backend_type = 'client backend'` (the leader) plus one row per parallel
+  worker that hit the error with `backend_type = 'parallel worker'`. Keep this
+  in mind when aggregating so you do not double-count a single logical error.
+
+- **`max_entries` is a hard cap.** Once the configured number of distinct
+  (backend_type, database, user, elevel, sqlerrcode) combinations has been
+  reached, new distinct combinations are dropped until `pg_stat_log_reset()`
+  is called, which reclaims all slots. Monitor `n_dropped` via
+  `pg_stat_log_info()` to detect when `max_entries` is too small. Size it to
+  cover the cardinality you expect -- roughly
+  `N_databases x N_roles x typical_distinct_sqlstates x backend_types` --
+  and remember it is `POSTMASTER`-context, so changes require a restart.
+
 ## Files
 
 | File | Purpose |
