@@ -84,5 +84,26 @@ SELECT pg_stat_force_next_flush();
 
 SELECT COALESCE(sum(count), 0) = 0 AS reset_ok FROM pg_stat_log_data();
 
+
+--
+-- Test 7: pg_stat_log_info() returns one row with expected columns
+--
+SELECT count(*) = 1 AS info_one_row FROM pg_stat_log_info();
+
+--
+-- Test 8: max_entries matches GUC
+--
+SELECT max_entries = current_setting('pg_stat_log.max_entries')::int AS max_matches_guc
+FROM pg_stat_log_info();
+
+--
+-- Test 9: After reset, num_entries and n_dropped are zero
+--
+SELECT pg_stat_log_reset();
+SELECT pg_stat_force_next_flush();
+
+SELECT num_entries = 0 AS num_zero, n_dropped = 0 AS dropped_zero
+FROM pg_stat_log_info();
+
 -- Clean up
 DROP EXTENSION pg_stat_log;

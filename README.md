@@ -136,6 +136,37 @@ ORDER BY count DESC;
 SELECT pg_stat_log_reset();
 ```
 
+
+Resetting also reclaims the tracked-combination slots, so new distinct
+combinations can be tracked after a reset even if `max_entries` had been
+reached previously.
+
+### Inspecting capacity and drops
+
+`pg_stat_log_info()` exposes metadata about the tracking state:
+
+```sql
+SELECT * FROM pg_stat_log_info();
+```
+
+```
+ max_entries | num_entries | n_dropped |          stats_reset
+-------------+-------------+-----------+-------------------------------
+        1024 |          37 |         0 | 2026-04-22 16:40:39.124+00
+```
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `max_entries` | int | Configured `pg_stat_log.max_entries` capacity |
+| `num_entries` | int | Distinct combinations currently tracked |
+| `n_dropped` | bigint | Log messages that could not be tracked because `max_entries` was full |
+| `stats_reset` | timestamptz | Timestamp of the last reset (or shared-memory init) |
+
+Monitor `n_dropped` to detect when `max_entries` is too small for your
+workload: if it grows over time, increase `pg_stat_log.max_entries` (and
+restart) so every distinct combination fits. `stats_reset` advances
+whenever `pg_stat_log_reset()` is called.
+
 ## How it works
 
 `pg_stat_log` uses the fixed-amount Custom Cumulative Stats API, following the

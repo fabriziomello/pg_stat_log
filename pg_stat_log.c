@@ -72,19 +72,23 @@ typedef struct PgStatLog
 {
     int           max_entries;
     int           num_entries;
-    TimestampTz   stat_reset_timestamp;
     PgStatLogSlot entries[FLEXIBLE_ARRAY_MEMBER];
 } PgStatLog;
 
 /*
- * Shared memory wrapper. LWLock + changecount + data. The data area
- * holds two consecutive PgStatLog blocks (stats + reset_offset).
+ * Shared memory wrapper. LWLock + changecount + metadata + data. Metadata
+ * fields (stat_reset_timestamp, n_dropped) live outside the copied stats
+ * blocks so they can be read directly under the LWLock without the
+ * changecount protocol. The data area holds two consecutive PgStatLog
+ * blocks (stats + reset_offset).
  */
 typedef struct PgStatLogShared
 {
-    LWLock lock;
-    uint32 changecount;
-    char   data[FLEXIBLE_ARRAY_MEMBER];
+    LWLock      lock;
+    uint32      changecount;
+    TimestampTz stat_reset_timestamp;
+    uint64      n_dropped;
+    char        data[FLEXIBLE_ARRAY_MEMBER];
 } PgStatLogShared;
 
 /*
@@ -173,16 +177,23 @@ pg_stat_log_init_shmem_cb(void *stats)
 {
     PgStatLogShared *shmem = (PgStatLogShared *) stats;
     PgStatLog       *s;
+    PgStatLog       *reset;
 
 #if PG_VERSION_NUM < 190000
     LWLockInitialize(&shmem->lock, LWLockNewTrancheId());
 #else
     LWLockInitialize(&shmem->lock, LWLockNewTrancheId(PGSTAT_LOG_TRANCHE_NAME));
 #endif
+    shmem->stat_reset_timestamp = GetCurrentTimestamp();
+    shmem->n_dropped            = 0;
 
     s              = pg_stat_log_get_stats(shmem);
     s->max_entries = pg_stat_log_max;
     s->num_entries = 0;
+
+    reset              = pg_stat_log_get_reset_offset(shmem);
+    reset->max_entries = pg_stat_log_max;
+    reset->num_entries = 0;
 }
 
 /*
@@ -209,6 +220,11 @@ pg_stat_log_shmem_startup(void)
 
 /*
  * reset_all_cb — reset statistics
+ *
+ * Zero the main stats block (slot array + num_entries) and the
+ * reset_offset block so that slots are reclaimed for reuse. Otherwise,
+ * once max_entries is reached, a reset would not free capacity for new
+ * distinct combinations.
  */
 static void
 pg_stat_log_reset_all_cb(TimestampTz ts)
@@ -222,8 +238,18 @@ pg_stat_log_reset_all_cb(TimestampTz ts)
     reset = pg_stat_log_get_reset_offset(shmem);
 
     LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
-    pgstat_copy_changecounted_stats(reset, s, stats_block_size, &shmem->changecount);
-    s->stat_reset_timestamp = ts;
+
+    pgstat_begin_changecount_write(&shmem->changecount);
+    MemSet(s->entries, 0, (Size) s->max_entries * sizeof(PgStatLogSlot));
+    s->num_entries = 0;
+    pgstat_end_changecount_write(&shmem->changecount);
+
+    MemSet(reset->entries, 0, (Size) reset->max_entries * sizeof(PgStatLogSlot));
+    reset->num_entries = 0;
+
+    shmem->stat_reset_timestamp = ts;
+    shmem->n_dropped            = 0;
+
     LWLockRelease(&shmem->lock);
 }
 
@@ -340,7 +366,10 @@ pg_stat_log_emit_hook(ErrorData *edata)
                     s->num_entries++;
                     pgstat_end_changecount_write(&shmem->changecount);
                 }
-                /* else: silently drop when full */
+                else
+                {
+                    shmem->n_dropped++;
+                }
                 break;
             }
 
@@ -355,6 +384,10 @@ pg_stat_log_emit_hook(ErrorData *edata)
                 break;
             }
         }
+
+        /* Full table scan without match — all slots occupied by other keys */
+        if (probe == s->max_entries)
+            shmem->n_dropped++;
     }
     PG_FINALLY();
     {
@@ -558,4 +591,47 @@ pg_stat_log_reset(PG_FUNCTION_ARGS)
     pgstat_reset_of_kind(PGSTAT_KIND_LOG);
 
     PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(pg_stat_log_info);
+
+/*
+ * pg_stat_log_info()
+ *		Return metadata about the pg_stat_log shared memory area:
+ *		max_entries capacity, current num_entries, number of dropped
+ *		messages due to capacity, and the last reset timestamp.
+ */
+Datum
+pg_stat_log_info(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    PgStatLogShared *shmem;
+    PgStatLog       *s;
+    Datum            values[4];
+    bool             nulls[4] = {0};
+    int              max_entries;
+    int              num_entries;
+    uint64           n_dropped;
+    TimestampTz      stat_reset_timestamp;
+
+    InitMaterializedSRF(fcinfo, 0);
+
+    shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
+    s     = pg_stat_log_get_stats(shmem);
+
+    LWLockAcquire(&shmem->lock, LW_SHARED);
+    max_entries          = s->max_entries;
+    num_entries          = s->num_entries;
+    n_dropped            = shmem->n_dropped;
+    stat_reset_timestamp = shmem->stat_reset_timestamp;
+    LWLockRelease(&shmem->lock);
+
+    values[0] = Int32GetDatum(max_entries);
+    values[1] = Int32GetDatum(num_entries);
+    values[2] = Int64GetDatum((int64) n_dropped);
+    values[3] = TimestampTzGetDatum(stat_reset_timestamp);
+
+    tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+
+    return (Datum) 0;
 }

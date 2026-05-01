@@ -43,3 +43,16 @@ GRANT EXECUTE ON FUNCTION pg_stat_log_data() TO pg_read_all_stats;
 
 REVOKE ALL ON pg_stat_log FROM PUBLIC;
 GRANT SELECT ON pg_stat_log TO pg_read_all_stats;
+
+CREATE FUNCTION pg_stat_log_info(
+    OUT max_entries int,
+    OUT num_entries int,
+    OUT n_dropped bigint,
+    OUT stats_reset timestamp with time zone
+)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'pg_stat_log_info'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+REVOKE ALL ON FUNCTION pg_stat_log_info() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_stat_log_info() TO pg_read_all_stats;
