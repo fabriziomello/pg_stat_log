@@ -54,6 +54,23 @@ $result = $node->safe_psql('postgres', q(
 is($result, $error_count_pre_restart,
 	"error count persists after clean restart");
 
+
+# ---------------------------------------------------------------
+# Test 1b: n_dropped and stats_reset do not persist across restart
+# ---------------------------------------------------------------
+
+my $n_dropped = $node->safe_psql('postgres', q(
+	SELECT n_dropped FROM pg_stat_log_info()
+));
+is($n_dropped, "0",
+	"n_dropped resets to 0 after clean restart");
+
+my $reset_ts = $node->safe_psql('postgres', q(
+	SELECT stats_reset FROM pg_stat_log_info()
+));
+ok(defined $reset_ts && $reset_ts ne '',
+	"stats_reset is set to startup timestamp after clean restart");
+
 # ---------------------------------------------------------------
 # Test 2: Stats lost after crash recovery
 # ---------------------------------------------------------------
@@ -136,7 +153,7 @@ my $num_entries = $node->safe_psql('postgres', q(
 ));
 is($num_entries, "64", "num_entries saturates at max_entries");
 
-my $n_dropped = $node->safe_psql('postgres', q(
+$n_dropped = $node->safe_psql('postgres', q(
 	SELECT n_dropped FROM pg_stat_log_info()
 ));
 ok($n_dropped > 0, "n_dropped > 0 after overflowing max_entries");

@@ -224,6 +224,13 @@ A few things to keep in mind when interpreting the counters:
   `N_databases x N_roles x typical_distinct_sqlstates x backend_types` --
   and remember it is `POSTMASTER`-context, so changes require a restart.
 
+
+- **`n_dropped` and `stats_reset` do not persist across restarts.** These
+  metadata fields are reinitialized at server startup. The per-combination
+  counters persist across clean restarts, but `n_dropped` resets to zero
+  and `stats_reset` is set to the startup timestamp. This is by design --
+  drop telemetry measures pressure since the last startup or reset.
+
 - **Caught PL/pgSQL exceptions are not counted.** If a `RAISE` inside a
   `BEGIN ... EXCEPTION WHEN OTHERS` block is caught by the exception handler,
   the message never reaches the server log and `emit_log_hook` does not fire.
