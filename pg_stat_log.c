@@ -304,9 +304,6 @@ pg_stat_log_emit_hook(ErrorData *edata)
     Oid              userid;
     bool             lock_held = false;
 
-    if (prev_emit_log_hook)
-        prev_emit_log_hook(edata);
-
     if (!pg_stat_log_enabled)
         return;
 
@@ -330,6 +327,9 @@ pg_stat_log_emit_hook(ErrorData *edata)
         uint32 hash;
         uint32 idx;
         int    probe;
+
+        if (prev_emit_log_hook)
+            prev_emit_log_hook(edata);
 
         shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
 
