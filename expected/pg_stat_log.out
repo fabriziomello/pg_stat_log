@@ -177,5 +177,14 @@ FROM pg_stat_log_info();
  t        | t
 (1 row)
 
+--
+-- Test 10: pg_stat_log_reset() is restricted to superusers
+--
+CREATE ROLE regress_pg_stat_log_user;
+SET ROLE regress_pg_stat_log_user;
+SELECT pg_stat_log_reset();
+ERROR:  permission denied for function pg_stat_log_reset
+RESET ROLE;
+DROP ROLE regress_pg_stat_log_user;
 -- Clean up
 DROP EXTENSION pg_stat_log;

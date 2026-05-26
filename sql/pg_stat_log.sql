@@ -105,5 +105,15 @@ SELECT pg_stat_force_next_flush();
 SELECT num_entries = 0 AS num_zero, n_dropped = 0 AS dropped_zero
 FROM pg_stat_log_info();
 
+
+--
+-- Test 10: pg_stat_log_reset() is restricted to superusers
+--
+CREATE ROLE regress_pg_stat_log_user;
+SET ROLE regress_pg_stat_log_user;
+SELECT pg_stat_log_reset();
+RESET ROLE;
+DROP ROLE regress_pg_stat_log_user;
+
 -- Clean up
 DROP EXTENSION pg_stat_log;
