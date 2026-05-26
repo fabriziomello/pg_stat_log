@@ -183,8 +183,8 @@ same pattern as PostgreSQL's in-tree `test_custom_fixed_stats` test module.
 
 3. **pgstat callbacks**: three callbacks mirror the test module --
    `init_shmem_cb` initializes the LWLock and array header,
-   `reset_all_cb` snapshots current counters into a reset baseline,
-   `snapshot_cb` copies stats and subtracts the reset baseline for reporting.
+   `reset_all_cb` zeroes counters and reclaims slots,
+   `snapshot_cb` copies stats for reporting.
 
 4. **Reporting**: `pg_stat_log_data()` is a set-returning C function that reads
    from the pgstat snapshot. The `pg_stat_log` view joins its output with

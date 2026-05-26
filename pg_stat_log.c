@@ -66,7 +66,6 @@ typedef struct PgStatLogSlot
 
 /*
  * Stats data block. Variable-length: header followed by entries[max].
- * Two of these exist in shared memory: stats and reset_offset.
  */
 typedef struct PgStatLog
 {
@@ -78,9 +77,8 @@ typedef struct PgStatLog
 /*
  * Shared memory wrapper. LWLock + changecount + metadata + data. Metadata
  * fields (stat_reset_timestamp, n_dropped) live outside the copied stats
- * blocks so they can be read directly under the LWLock without the
- * changecount protocol. The data area holds two consecutive PgStatLog
- * blocks (stats + reset_offset).
+ * block so they can be read directly under the LWLock without the
+ * changecount protocol. The data area holds one PgStatLog block.
  */
 typedef struct PgStatLogShared
 {
@@ -117,12 +115,6 @@ static inline PgStatLog *
 pg_stat_log_get_stats(PgStatLogShared *shmem)
 {
     return (PgStatLog *) shmem->data;
-}
-
-static inline PgStatLog *
-pg_stat_log_get_reset_offset(PgStatLogShared *shmem)
-{
-    return (PgStatLog *) (shmem->data + stats_block_size);
 }
 
 /*
@@ -186,8 +178,6 @@ pg_stat_log_init_backend_cb(void)
 
     if (s->max_entries != pg_stat_log_max)
     {
-        PgStatLog *reset;
-
         elog(LOG,
              "pg_stat_log: discarding persisted stats "
              "(max_entries changed from %d to %d)",
@@ -201,11 +191,6 @@ pg_stat_log_init_backend_cb(void)
         s->num_entries = 0;
         MemSet(s->entries, 0, (Size) pg_stat_log_max * sizeof(PgStatLogSlot));
         pgstat_end_changecount_write(&shmem->changecount);
-
-        reset              = pg_stat_log_get_reset_offset(shmem);
-        reset->max_entries = pg_stat_log_max;
-        reset->num_entries = 0;
-        MemSet(reset->entries, 0, (Size) pg_stat_log_max * sizeof(PgStatLogSlot));
 
         shmem->stat_reset_timestamp = GetCurrentTimestamp();
         shmem->n_dropped            = 0;
@@ -226,7 +211,6 @@ pg_stat_log_init_shmem_cb(void *stats)
 {
     PgStatLogShared *shmem = (PgStatLogShared *) stats;
     PgStatLog       *s;
-    PgStatLog       *reset;
 
 #if PG_VERSION_NUM < 190000
     LWLockInitialize(&shmem->lock, LWLockNewTrancheId());
@@ -239,10 +223,6 @@ pg_stat_log_init_shmem_cb(void *stats)
     s              = pg_stat_log_get_stats(shmem);
     s->max_entries = pg_stat_log_max;
     s->num_entries = 0;
-
-    reset              = pg_stat_log_get_reset_offset(shmem);
-    reset->max_entries = pg_stat_log_max;
-    reset->num_entries = 0;
 }
 
 /*
@@ -270,21 +250,18 @@ pg_stat_log_shmem_startup(void)
 /*
  * reset_all_cb — reset statistics
  *
- * Zero the main stats block (slot array + num_entries) and the
- * reset_offset block so that slots are reclaimed for reuse. Otherwise,
- * once max_entries is reached, a reset would not free capacity for new
- * distinct combinations.
+ * Zero the stats block (slot array + num_entries) so that slots are
+ * reclaimed for reuse. Otherwise, once max_entries is reached, a reset
+ * would not free capacity for new distinct combinations.
  */
 static void
 pg_stat_log_reset_all_cb(TimestampTz ts)
 {
     PgStatLogShared *shmem;
     PgStatLog       *s;
-    PgStatLog       *reset;
 
     shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
     s     = pg_stat_log_get_stats(shmem);
-    reset = pg_stat_log_get_reset_offset(shmem);
 
     LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
 
@@ -292,9 +269,6 @@ pg_stat_log_reset_all_cb(TimestampTz ts)
     MemSet(s->entries, 0, (Size) s->max_entries * sizeof(PgStatLogSlot));
     s->num_entries = 0;
     pgstat_end_changecount_write(&shmem->changecount);
-
-    MemSet(reset->entries, 0, (Size) reset->max_entries * sizeof(PgStatLogSlot));
-    reset->num_entries = 0;
 
     shmem->stat_reset_timestamp = ts;
     shmem->n_dropped            = 0;
@@ -310,9 +284,6 @@ pg_stat_log_snapshot_cb(void)
 {
     PgStatLogShared *shmem;
     PgStatLog       *snap;
-    PgStatLog       *reset;
-    PgStatLog       *reset_local;
-    int              i;
 
     shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
     snap  = (PgStatLog *) pgstat_get_custom_snapshot_data(PGSTAT_KIND_LOG);
@@ -322,23 +293,6 @@ pg_stat_log_snapshot_cb(void)
                                     pg_stat_log_get_stats(shmem),
                                     stats_block_size,
                                     &shmem->changecount);
-
-    /* Read reset_offset under shared lock */
-    reset       = pg_stat_log_get_reset_offset(shmem);
-    reset_local = (PgStatLog *) palloc(stats_block_size);
-
-    LWLockAcquire(&shmem->lock, LW_SHARED);
-    memcpy(reset_local, reset, stats_block_size);
-    LWLockRelease(&shmem->lock);
-
-    /* Apply reset offsets — same as FIXED_COMP in test module */
-    for (i = 0; i < snap->max_entries; i++)
-    {
-        if (snap->entries[i].used && reset_local->entries[i].used)
-            snap->entries[i].count -= reset_local->entries[i].count;
-    }
-
-    pfree(reset_local);
 }
 
 /*
@@ -531,7 +485,7 @@ _PG_init(void)
     stats_block_size =
         offsetof(PgStatLog, entries) + (Size) pg_stat_log_max * sizeof(PgStatLogSlot);
 
-    shared_size = offsetof(PgStatLogShared, data) + 2 * stats_block_size;
+    shared_size = offsetof(PgStatLogShared, data) + stats_block_size;
 
     /* Fill in the KindInfo struct — use memcpy because .name is const */
     {
@@ -596,7 +550,6 @@ pg_stat_log_data(PG_FUNCTION_ARGS)
         if (!slot->used)
             continue;
 
-        /* Skip entries whose count went to zero after reset subtraction */
         if (slot->count <= 0)
             continue;
 
