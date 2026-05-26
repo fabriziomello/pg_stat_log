@@ -46,9 +46,9 @@ PG_MODULE_MAGIC_EXT(.name = PGSTAT_LOG_MODULE_NAME, .version = PG_VERSION);
 #define PGSTAT_KIND_LOG 28
 
 /* GUC defaults and bounds */
-#define PGSTAT_LOG_DEFAULT_MAX 1024
-#define PGSTAT_LOG_MIN_MAX     64
-#define PGSTAT_LOG_MAX_MAX     INT_MAX
+#define PGSTAT_LOG_MAX_DEFAULT 1024
+#define PGSTAT_LOG_MIN_ENTRIES 64
+#define PGSTAT_LOG_MAX_ENTRIES (PGSTAT_LOG_MAX_DEFAULT * PGSTAT_LOG_MAX_DEFAULT)
 
 /*
  * Data structures
@@ -94,7 +94,7 @@ typedef struct PgStatLogShared
  */
 static bool pg_stat_log_enabled    = true;
 static int  pg_stat_log_min_elevel = WARNING;
-static int  pg_stat_log_max        = PGSTAT_LOG_DEFAULT_MAX;
+static int  pg_stat_log_max        = PGSTAT_LOG_MAX_DEFAULT;
 
 /*
  * Computed sizes (set in _PG_init based on pg_stat_log.max_entries)
@@ -470,9 +470,9 @@ _PG_init(void)
                             "combinations to track.",
                             NULL,
                             &pg_stat_log_max,
-                            PGSTAT_LOG_DEFAULT_MAX,
-                            PGSTAT_LOG_MIN_MAX,
-                            PGSTAT_LOG_MAX_MAX,
+                            PGSTAT_LOG_MAX_DEFAULT,
+                            PGSTAT_LOG_MIN_ENTRIES,
+                            PGSTAT_LOG_MAX_ENTRIES,
                             PGC_POSTMASTER,
                             0,
                             NULL,
