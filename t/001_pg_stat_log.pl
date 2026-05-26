@@ -171,4 +171,49 @@ my $post_reset = $node->safe_psql('postgres', q(
 is($post_reset, "1",
 	"new distinct error is tracked after reset (slots reclaimed)");
 
+
+# ---------------------------------------------------------------
+# Test 6: Stats discarded when max_entries changes across restart
+# ---------------------------------------------------------------
+
+# Generate some stats with the current max_entries=64
+$node->safe_psql('postgres', q(SELECT pg_stat_log_reset()));
+$node->safe_psql('postgres', q{
+	DO $$ BEGIN RAISE WARNING 'before resize'; END $$;
+});
+$node->safe_psql('postgres', q(SELECT pg_stat_force_next_flush()));
+
+$num_entries = $node->safe_psql('postgres', q(
+	SELECT num_entries FROM pg_stat_log_info()
+));
+ok($num_entries > 0, "have entries before max_entries change");
+
+# Clean restart with a different max_entries
+$node->stop;
+$node->append_conf('postgresql.conf', "pg_stat_log.max_entries = 128");
+$node->start;
+
+# Stats should have been discarded due to capacity mismatch
+$max_entries = $node->safe_psql('postgres', q(
+	SELECT max_entries FROM pg_stat_log_info()
+));
+is($max_entries, "128", "max_entries reflects new GUC after restart");
+
+$num_entries = $node->safe_psql('postgres', q(
+	SELECT num_entries FROM pg_stat_log_info()
+));
+is($num_entries, "0",
+	"persisted stats discarded after max_entries change");
+
+# Verify new entries can be tracked with the new capacity
+$node->safe_psql('postgres', q{
+	DO $$ BEGIN RAISE WARNING 'after resize'; END $$;
+});
+$node->safe_psql('postgres', q(SELECT pg_stat_force_next_flush()));
+
+$num_entries = $node->safe_psql('postgres', q(
+	SELECT num_entries FROM pg_stat_log_info()
+));
+ok($num_entries > 0, "new entries tracked after max_entries change");
+
 done_testing();

@@ -159,11 +159,60 @@ pg_stat_log_hash_key(BackendType backend_type, Oid dboid, Oid userid, int elevel
 /*
  * PgStat_KindInfo — filled dynamically in _PG_init
  */
+static void pg_stat_log_init_backend_cb(void);
 static void pg_stat_log_init_shmem_cb(void *stats);
 static void pg_stat_log_reset_all_cb(TimestampTz ts);
 static void pg_stat_log_snapshot_cb(void);
 
 static PgStat_KindInfo log_stats_kind;
+
+/*
+ * init_backend_cb — per-backend initialization
+ *
+ * Runs in every backend after the stats file has been loaded by the
+ * startup process. Validates that persisted max_entries matches the
+ * current GUC. If pg_stat_log.max_entries was changed across a clean
+ * restart, the restored stats block has a stale layout — discard and
+ * reinitialize to prevent out-of-bounds access.
+ */
+static void
+pg_stat_log_init_backend_cb(void)
+{
+    PgStatLogShared *shmem;
+    PgStatLog       *s;
+
+    shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
+    s     = pg_stat_log_get_stats(shmem);
+
+    if (s->max_entries != pg_stat_log_max)
+    {
+        PgStatLog *reset;
+
+        elog(LOG,
+             "pg_stat_log: discarding persisted stats "
+             "(max_entries changed from %d to %d)",
+             s->max_entries,
+             pg_stat_log_max);
+
+        LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
+
+        pgstat_begin_changecount_write(&shmem->changecount);
+        s->max_entries = pg_stat_log_max;
+        s->num_entries = 0;
+        MemSet(s->entries, 0, (Size) pg_stat_log_max * sizeof(PgStatLogSlot));
+        pgstat_end_changecount_write(&shmem->changecount);
+
+        reset              = pg_stat_log_get_reset_offset(shmem);
+        reset->max_entries = pg_stat_log_max;
+        reset->num_entries = 0;
+        MemSet(reset->entries, 0, (Size) pg_stat_log_max * sizeof(PgStatLogSlot));
+
+        shmem->stat_reset_timestamp = GetCurrentTimestamp();
+        shmem->n_dropped            = 0;
+
+        LWLockRelease(&shmem->lock);
+    }
+}
 
 /*
  * init_shmem_cb — initialize shared memory
@@ -493,6 +542,7 @@ _PG_init(void)
             .shared_size     = shared_size,
             .shared_data_off = offsetof(PgStatLogShared, data),
             .shared_data_len = stats_block_size,
+            .init_backend_cb = pg_stat_log_init_backend_cb,
             .init_shmem_cb   = pg_stat_log_init_shmem_cb,
             .reset_all_cb    = pg_stat_log_reset_all_cb,
             .snapshot_cb     = pg_stat_log_snapshot_cb,
