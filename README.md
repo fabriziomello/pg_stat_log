@@ -224,6 +224,11 @@ A few things to keep in mind when interpreting the counters:
   `N_databases x N_roles x typical_distinct_sqlstates x backend_types` --
   and remember it is `POSTMASTER`-context, so changes require a restart.
 
+- **Caught PL/pgSQL exceptions are not counted.** If a `RAISE` inside a
+  `BEGIN ... EXCEPTION WHEN OTHERS` block is caught by the exception handler,
+  the message never reaches the server log and `emit_log_hook` does not fire.
+  Only messages that actually make it to the log are tracked.
+
 ## Files
 
 | File | Purpose |
