@@ -306,12 +306,7 @@ pg_stat_log_emit_hook(ErrorData *edata)
     Oid              dboid;
     Oid              userid;
     bool             lock_held = false;
-
-    if (!pg_stat_log_enabled)
-        return;
-
-    if (edata->elevel < pg_stat_log_min_elevel)
-        return;
+    bool             do_count  = true;
 
     if (in_emit_log_hook)
         return;
@@ -331,66 +326,78 @@ pg_stat_log_emit_hook(ErrorData *edata)
         uint32 idx;
         int    probe;
 
+        /* Always forward to previous hook regardless of our own filters */
         if (prev_emit_log_hook)
             prev_emit_log_hook(edata);
 
-        shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
+        /* pg_stat_log's own filters — skip counting, not the chain */
+        if (!pg_stat_log_enabled || edata->elevel < pg_stat_log_min_elevel)
+            do_count = false;
 
-        dboid = MyDatabaseId;
-        GetUserIdAndSecContext(&userid, &sec_context);
-
-        LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
-        lock_held = true;
-
-        s = pg_stat_log_get_stats(shmem);
-
-        /* O(1) hash probe to find or insert entry */
-        hash = pg_stat_log_hash_key(MyBackendType, dboid, userid, edata->elevel, edata->sqlerrcode);
-        idx  = hash % s->max_entries;
-
-        for (probe = 0; probe < s->max_entries; probe++)
+        if (do_count)
         {
-            uint32         pos  = (idx + probe) % s->max_entries;
-            PgStatLogSlot *slot = &s->entries[pos];
+            shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
 
-            if (!slot->used)
+            dboid = MyDatabaseId;
+            GetUserIdAndSecContext(&userid, &sec_context);
+
+            LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
+            lock_held = true;
+
+            s = pg_stat_log_get_stats(shmem);
+
+            /* O(1) hash probe to find or insert entry */
+            hash = pg_stat_log_hash_key(MyBackendType,
+                                        dboid,
+                                        userid,
+                                        edata->elevel,
+                                        edata->sqlerrcode);
+            idx  = hash % s->max_entries;
+
+            for (probe = 0; probe < s->max_entries; probe++)
             {
-                /* Empty slot — insert if space available */
-                if (s->num_entries < s->max_entries)
+                uint32         pos  = (idx + probe) % s->max_entries;
+                PgStatLogSlot *slot = &s->entries[pos];
+
+                if (!slot->used)
                 {
+                    /* Empty slot — insert if space available */
+                    if (s->num_entries < s->max_entries)
+                    {
+                        pgstat_begin_changecount_write(&shmem->changecount);
+                        slot->used         = true;
+                        slot->backend_type = MyBackendType;
+                        slot->dboid        = dboid;
+                        slot->userid       = userid;
+                        slot->elevel       = edata->elevel;
+                        slot->sqlerrcode   = edata->sqlerrcode;
+                        slot->count        = 1;
+                        s->num_entries++;
+                        pgstat_end_changecount_write(&shmem->changecount);
+                    }
+                    else
+                    {
+                        shmem->n_dropped++;
+                    }
+                    break;
+                }
+
+                if (slot->backend_type == MyBackendType && slot->dboid == dboid &&
+                    slot->userid == userid && slot->elevel == edata->elevel &&
+                    slot->sqlerrcode == edata->sqlerrcode)
+                {
+                    /* Match — increment counter */
                     pgstat_begin_changecount_write(&shmem->changecount);
-                    slot->used         = true;
-                    slot->backend_type = MyBackendType;
-                    slot->dboid        = dboid;
-                    slot->userid       = userid;
-                    slot->elevel       = edata->elevel;
-                    slot->sqlerrcode   = edata->sqlerrcode;
-                    slot->count        = 1;
-                    s->num_entries++;
+                    slot->count++;
                     pgstat_end_changecount_write(&shmem->changecount);
+                    break;
                 }
-                else
-                {
-                    shmem->n_dropped++;
-                }
-                break;
             }
 
-            if (slot->backend_type == MyBackendType && slot->dboid == dboid &&
-                slot->userid == userid && slot->elevel == edata->elevel &&
-                slot->sqlerrcode == edata->sqlerrcode)
-            {
-                /* Match — increment counter */
-                pgstat_begin_changecount_write(&shmem->changecount);
-                slot->count++;
-                pgstat_end_changecount_write(&shmem->changecount);
-                break;
-            }
+            /* Full table scan without match — all slots occupied by other keys */
+            if (probe == s->max_entries)
+                shmem->n_dropped++;
         }
-
-        /* Full table scan without match — all slots occupied by other keys */
-        if (probe == s->max_entries)
-            shmem->n_dropped++;
     }
     PG_FINALLY();
     {
