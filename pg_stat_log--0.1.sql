@@ -1,4 +1,4 @@
-/* pg_stat_log/pg_stat_log--1.0.sql */
+/* pg_stat_log/pg_stat_log--0.1.sql */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pg_stat_log" to load this file. \quit

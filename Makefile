@@ -1,7 +1,7 @@
 MODULE_big = pg_stat_log
 
 EXTENSION = pg_stat_log
-DATA = pg_stat_log--1.0.sql
+DATA = pg_stat_log--0.1.sql
 
 OBJS = pg_stat_log.o
 
