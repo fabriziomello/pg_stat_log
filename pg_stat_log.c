@@ -296,18 +296,88 @@ pg_stat_log_snapshot_cb(void)
 }
 
 /*
- * emit_log_hook — count log messages
+ * pg_stat_log_count_message — record one log message in shared memory
+ *
+ * Acquires the LWLock, does an O(1) hash probe to find or create the
+ * entry, increments the counter, and releases the lock.
  */
 static void
-pg_stat_log_emit_hook(ErrorData *edata)
+pg_stat_log_count_message(ErrorData *edata)
 {
     PgStatLogShared *shmem;
     PgStatLog       *s;
     Oid              dboid;
     Oid              userid;
-    bool             lock_held = false;
-    bool             do_count  = true;
+    int              sec_context;
+    uint32           hash;
+    uint32           idx;
+    int              probe;
 
+    shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
+
+    dboid = MyDatabaseId;
+    GetUserIdAndSecContext(&userid, &sec_context);
+
+    LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
+
+    s = pg_stat_log_get_stats(shmem);
+
+    hash = pg_stat_log_hash_key(MyBackendType, dboid, userid, edata->elevel, edata->sqlerrcode);
+    idx  = hash % s->max_entries;
+
+    for (probe = 0; probe < s->max_entries; probe++)
+    {
+        uint32         pos  = (idx + probe) % s->max_entries;
+        PgStatLogSlot *slot = &s->entries[pos];
+
+        if (!slot->used)
+        {
+            if (s->num_entries < s->max_entries)
+            {
+                pgstat_begin_changecount_write(&shmem->changecount);
+                slot->used         = true;
+                slot->backend_type = MyBackendType;
+                slot->dboid        = dboid;
+                slot->userid       = userid;
+                slot->elevel       = edata->elevel;
+                slot->sqlerrcode   = edata->sqlerrcode;
+                slot->count        = 1;
+                s->num_entries++;
+                pgstat_end_changecount_write(&shmem->changecount);
+            }
+            else
+            {
+                shmem->n_dropped++;
+            }
+            break;
+        }
+
+        if (slot->backend_type == MyBackendType && slot->dboid == dboid && slot->userid == userid &&
+            slot->elevel == edata->elevel && slot->sqlerrcode == edata->sqlerrcode)
+        {
+            pgstat_begin_changecount_write(&shmem->changecount);
+            slot->count++;
+            pgstat_end_changecount_write(&shmem->changecount);
+            break;
+        }
+    }
+
+    /* Full table scan without match — all slots occupied by other keys */
+    if (probe == s->max_entries)
+        shmem->n_dropped++;
+
+    LWLockRelease(&shmem->lock);
+}
+
+/*
+ * emit_log_hook — intercept log messages for counting
+ *
+ * Always forwards to the previous hook in the chain. Only counts the
+ * message if pg_stat_log is enabled and the severity meets the threshold.
+ */
+static void
+pg_stat_log_emit_hook(ErrorData *edata)
+{
     if (in_emit_log_hook)
         return;
 
@@ -321,88 +391,14 @@ pg_stat_log_emit_hook(ErrorData *edata)
     in_emit_log_hook = true;
     PG_TRY();
     {
-        int    sec_context;
-        uint32 hash;
-        uint32 idx;
-        int    probe;
-
-        /* Always forward to previous hook regardless of our own filters */
         if (prev_emit_log_hook)
             prev_emit_log_hook(edata);
 
-        /* pg_stat_log's own filters — skip counting, not the chain */
-        if (!pg_stat_log_enabled || edata->elevel < pg_stat_log_min_elevel)
-            do_count = false;
-
-        if (do_count)
-        {
-            shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
-
-            dboid = MyDatabaseId;
-            GetUserIdAndSecContext(&userid, &sec_context);
-
-            LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
-            lock_held = true;
-
-            s = pg_stat_log_get_stats(shmem);
-
-            /* O(1) hash probe to find or insert entry */
-            hash = pg_stat_log_hash_key(MyBackendType,
-                                        dboid,
-                                        userid,
-                                        edata->elevel,
-                                        edata->sqlerrcode);
-            idx  = hash % s->max_entries;
-
-            for (probe = 0; probe < s->max_entries; probe++)
-            {
-                uint32         pos  = (idx + probe) % s->max_entries;
-                PgStatLogSlot *slot = &s->entries[pos];
-
-                if (!slot->used)
-                {
-                    /* Empty slot — insert if space available */
-                    if (s->num_entries < s->max_entries)
-                    {
-                        pgstat_begin_changecount_write(&shmem->changecount);
-                        slot->used         = true;
-                        slot->backend_type = MyBackendType;
-                        slot->dboid        = dboid;
-                        slot->userid       = userid;
-                        slot->elevel       = edata->elevel;
-                        slot->sqlerrcode   = edata->sqlerrcode;
-                        slot->count        = 1;
-                        s->num_entries++;
-                        pgstat_end_changecount_write(&shmem->changecount);
-                    }
-                    else
-                    {
-                        shmem->n_dropped++;
-                    }
-                    break;
-                }
-
-                if (slot->backend_type == MyBackendType && slot->dboid == dboid &&
-                    slot->userid == userid && slot->elevel == edata->elevel &&
-                    slot->sqlerrcode == edata->sqlerrcode)
-                {
-                    /* Match — increment counter */
-                    pgstat_begin_changecount_write(&shmem->changecount);
-                    slot->count++;
-                    pgstat_end_changecount_write(&shmem->changecount);
-                    break;
-                }
-            }
-
-            /* Full table scan without match — all slots occupied by other keys */
-            if (probe == s->max_entries)
-                shmem->n_dropped++;
-        }
+        if (pg_stat_log_enabled && edata->elevel >= pg_stat_log_min_elevel)
+            pg_stat_log_count_message(edata);
     }
     PG_FINALLY();
     {
-        if (lock_held)
-            LWLockRelease(&shmem->lock);
         in_emit_log_hook = false;
     }
     PG_END_TRY();
