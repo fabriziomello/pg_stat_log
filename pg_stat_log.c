@@ -55,7 +55,7 @@ PG_MODULE_MAGIC_EXT(.name = PGSTAT_LOG_MODULE_NAME, .version = PG_VERSION);
  */
 typedef struct PgStatLogSlot
 {
-    bool           used;
+    int32          next;          /* next slot index in bucket chain, or -1 */
     BackendType    backend_type;
     Oid            dboid;
     Oid            userid;
@@ -65,13 +65,25 @@ typedef struct PgStatLogSlot
 } PgStatLogSlot;
 
 /*
- * Stats data block. Variable-length: header followed by entries[max].
+ * Stats data block. Variable-length: a header followed by a payload laid out
+ * as (entries first to keep 8-byte alignment without padding):
+ *
+ *   PgStatLogSlot entries[max_entries]   insertion-ordered slots
+ *   int32         heads[max_entries]     bucket chain heads (-1 = empty)
+ *
+ * The slots form an index-based separate-chaining hash table: heads[bucket]
+ * points to the first slot of a chain and each slot's "next" links the rest.
+ * Slots are allocated sequentially (slot i is live iff i < num_entries) and
+ * never evicted, so lookups, inserts, and drops walk only one bucket chain
+ * (average length = load factor) and stay O(1) expected even at full load.
+ * Links are array indices (not pointers), so the block is snapshot- and
+ * persistence-safe.  Use the accessors below to reach each sub-array.
  */
 typedef struct PgStatLog
 {
-    int           max_entries;
-    int           num_entries;
-    PgStatLogSlot entries[FLEXIBLE_ARRAY_MEMBER];
+    int  max_entries;
+    int  num_entries;
+    char data[FLEXIBLE_ARRAY_MEMBER];
 } PgStatLog;
 
 /*
@@ -117,6 +129,18 @@ pg_stat_log_get_stats(PgStatLogShared *shmem)
     return (PgStatLog *) shmem->data;
 }
 
+static inline PgStatLogSlot *
+pg_stat_log_entries(PgStatLog *s)
+{
+    return (PgStatLogSlot *) s->data;
+}
+
+static inline int32 *
+pg_stat_log_heads(PgStatLog *s)
+{
+    return (int32 *) (s->data + sizeof(PgStatLogSlot) * (Size) s->max_entries);
+}
+
 /*
  * Errcode name lookup
  */
@@ -133,7 +157,7 @@ pg_stat_log_errcode_name(int sqlerrcode)
 
 /*
  * Hash function for slot lookup — combines all key fields into a uint32
- * for open-addressing into the entries array.
+ * used to pick a chain bucket (hash % max_entries).
  */
 static inline uint32
 pg_stat_log_hash_key(BackendType backend_type, Oid dboid, Oid userid, int elevel, int sqlerrcode)
@@ -189,7 +213,7 @@ pg_stat_log_init_backend_cb(void)
         pgstat_begin_changecount_write(&shmem->changecount);
         s->max_entries = pg_stat_log_max;
         s->num_entries = 0;
-        MemSet(s->entries, 0, (Size) pg_stat_log_max * sizeof(PgStatLogSlot));
+        memset(pg_stat_log_heads(s), 0xFF, sizeof(int32) * (Size) s->max_entries);
         pgstat_end_changecount_write(&shmem->changecount);
 
         shmem->stat_reset_timestamp = GetCurrentTimestamp();
@@ -223,6 +247,7 @@ pg_stat_log_init_shmem_cb(void *stats)
     s              = pg_stat_log_get_stats(shmem);
     s->max_entries = pg_stat_log_max;
     s->num_entries = 0;
+    memset(pg_stat_log_heads(s), 0xFF, sizeof(int32) * (Size) s->max_entries);
 }
 
 /*
@@ -250,9 +275,9 @@ pg_stat_log_shmem_startup(void)
 /*
  * reset_all_cb — reset statistics
  *
- * Zero the stats block (slot array + num_entries) so that slots are
- * reclaimed for reuse. Otherwise, once max_entries is reached, a reset
- * would not free capacity for new distinct combinations.
+ * Empty all bucket chains and reset num_entries so slots are reclaimed for
+ * reuse. Otherwise, once max_entries is reached, a reset would not free
+ * capacity for new distinct combinations.
  */
 static void
 pg_stat_log_reset_all_cb(TimestampTz ts)
@@ -266,8 +291,8 @@ pg_stat_log_reset_all_cb(TimestampTz ts)
     LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
 
     pgstat_begin_changecount_write(&shmem->changecount);
-    MemSet(s->entries, 0, (Size) s->max_entries * sizeof(PgStatLogSlot));
     s->num_entries = 0;
+    memset(pg_stat_log_heads(s), 0xFF, sizeof(int32) * (Size) s->max_entries);
     pgstat_end_changecount_write(&shmem->changecount);
 
     shmem->stat_reset_timestamp = ts;
@@ -298,20 +323,25 @@ pg_stat_log_snapshot_cb(void)
 /*
  * pg_stat_log_count_message — record one log message in shared memory
  *
- * Acquires the LWLock, does an O(1) hash probe to find or create the
- * entry, increments the counter, and releases the lock.
+ * Acquires the LWLock, walks the hash bucket chain to find or create the
+ * entry, increments the counter, and releases the lock. The chain walk is
+ * O(1) expected (average chain length = load factor) for all of lookup,
+ * insert, and drop, even when the table is full.
  */
 static void
 pg_stat_log_count_message(ErrorData *edata)
 {
     PgStatLogShared *shmem;
     PgStatLog       *s;
+    PgStatLogSlot   *entries;
+    int32           *heads;
     Oid              dboid;
     Oid              userid;
     int              sec_context;
     uint32           hash;
-    uint32           idx;
-    int              probe;
+    uint32           bucket;
+    int32            idx;
+    bool             found;
 
     shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
 
@@ -320,37 +350,17 @@ pg_stat_log_count_message(ErrorData *edata)
 
     LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
 
-    s = pg_stat_log_get_stats(shmem);
+    s       = pg_stat_log_get_stats(shmem);
+    entries = pg_stat_log_entries(s);
+    heads   = pg_stat_log_heads(s);
 
-    hash = pg_stat_log_hash_key(MyBackendType, dboid, userid, edata->elevel, edata->sqlerrcode);
-    idx  = hash % s->max_entries;
+    hash   = pg_stat_log_hash_key(MyBackendType, dboid, userid, edata->elevel, edata->sqlerrcode);
+    bucket = hash % s->max_entries;
 
-    for (probe = 0; probe < s->max_entries; probe++)
+    found = false;
+    for (idx = heads[bucket]; idx != -1; idx = entries[idx].next)
     {
-        uint32         pos  = (idx + probe) % s->max_entries;
-        PgStatLogSlot *slot = &s->entries[pos];
-
-        if (!slot->used)
-        {
-            if (s->num_entries < s->max_entries)
-            {
-                pgstat_begin_changecount_write(&shmem->changecount);
-                slot->used         = true;
-                slot->backend_type = MyBackendType;
-                slot->dboid        = dboid;
-                slot->userid       = userid;
-                slot->elevel       = edata->elevel;
-                slot->sqlerrcode   = edata->sqlerrcode;
-                slot->count        = 1;
-                s->num_entries++;
-                pgstat_end_changecount_write(&shmem->changecount);
-            }
-            else
-            {
-                shmem->n_dropped++;
-            }
-            break;
-        }
+        PgStatLogSlot *slot = &entries[idx];
 
         if (slot->backend_type == MyBackendType && slot->dboid == dboid && slot->userid == userid &&
             slot->elevel == edata->elevel && slot->sqlerrcode == edata->sqlerrcode)
@@ -358,13 +368,35 @@ pg_stat_log_count_message(ErrorData *edata)
             pgstat_begin_changecount_write(&shmem->changecount);
             slot->count++;
             pgstat_end_changecount_write(&shmem->changecount);
+            found = true;
             break;
         }
     }
 
-    /* Full table scan without match — all slots occupied by other keys */
-    if (probe == s->max_entries)
-        shmem->n_dropped++;
+    if (!found)
+    {
+        if (s->num_entries < s->max_entries)
+        {
+            int32          newidx = s->num_entries;
+            PgStatLogSlot *slot   = &entries[newidx];
+
+            pgstat_begin_changecount_write(&shmem->changecount);
+            slot->backend_type = MyBackendType;
+            slot->dboid        = dboid;
+            slot->userid       = userid;
+            slot->elevel       = edata->elevel;
+            slot->sqlerrcode   = edata->sqlerrcode;
+            slot->count        = 1;
+            slot->next         = heads[bucket];
+            heads[bucket]      = newidx;
+            s->num_entries++;
+            pgstat_end_changecount_write(&shmem->changecount);
+        }
+        else
+        {
+            shmem->n_dropped++;
+        }
+    }
 
     LWLockRelease(&shmem->lock);
 }
@@ -485,8 +517,9 @@ _PG_init(void)
     MarkGUCPrefixReserved("pg_stat_log");
 
     /* Compute sizes based on pg_stat_log.max_entries */
-    stats_block_size =
-        offsetof(PgStatLog, entries) + (Size) pg_stat_log_max * sizeof(PgStatLogSlot);
+    stats_block_size = offsetof(PgStatLog, data)
+        + sizeof(PgStatLogSlot) * (Size) pg_stat_log_max
+        + sizeof(int32) * (Size) pg_stat_log_max;
 
     shared_size = offsetof(PgStatLogShared, data) + stats_block_size;
 
@@ -536,6 +569,7 @@ pg_stat_log_data(PG_FUNCTION_ARGS)
 {
     ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
     PgStatLog     *snap;
+    PgStatLogSlot *entries;
     int            i;
 
     pgstat_snapshot_fixed(PGSTAT_KIND_LOG);
@@ -543,15 +577,14 @@ pg_stat_log_data(PG_FUNCTION_ARGS)
 
     InitMaterializedSRF(fcinfo, 0);
 
-    for (i = 0; i < snap->max_entries; i++)
+    entries = pg_stat_log_entries(snap);
+
+    for (i = 0; i < snap->num_entries; i++)
     {
         Datum          values[7];
         bool           nulls[7] = {0};
-        PgStatLogSlot *slot     = &snap->entries[i];
+        PgStatLogSlot *slot     = &entries[i];
         const char    *errname;
-
-        if (!slot->used)
-            continue;
 
         if (slot->count <= 0)
             continue;

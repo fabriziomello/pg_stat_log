@@ -158,6 +158,20 @@ $n_dropped = $node->safe_psql('postgres', q(
 ));
 ok($n_dropped > 0, "n_dropped > 0 after overflowing max_entries");
 
+# An already-tracked signature must keep counting even when the table is full
+my $tracked_code = $node->safe_psql('postgres', q(
+	SELECT sqlerrcode FROM pg_stat_log_data() LIMIT 1
+));
+my $count_before = $node->safe_psql('postgres',
+	"SELECT count FROM pg_stat_log_data() WHERE sqlerrcode = '$tracked_code'");
+$node->safe_psql('postgres',
+	"DO \$\$ BEGIN RAISE WARNING 'still counts' USING ERRCODE = '$tracked_code'; END \$\$;");
+$node->safe_psql('postgres', q(SELECT pg_stat_force_next_flush()));
+my $count_after = $node->safe_psql('postgres',
+	"SELECT count FROM pg_stat_log_data() WHERE sqlerrcode = '$tracked_code'");
+cmp_ok($count_after, '>', $count_before,
+	"tracked signature still counts when table is full");
+
 # Reset should reclaim slots
 $node->safe_psql('postgres', q(SELECT pg_stat_log_reset()));
 
