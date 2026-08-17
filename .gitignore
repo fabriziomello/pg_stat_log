@@ -30,7 +30,7 @@ lib*.pc
 
 # Extension specific excludes
 /results/
-/tmp_check/
+/tmp*/
 /log/
 /.idea/
 pg_stat_log_errcodes.h

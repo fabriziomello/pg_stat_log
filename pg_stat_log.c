@@ -55,7 +55,7 @@ PG_MODULE_MAGIC_EXT(.name = PGSTAT_LOG_MODULE_NAME, .version = PG_VERSION);
  */
 typedef struct PgStatLogSlot
 {
-    int32          next;          /* next slot index in bucket chain, or -1 */
+    int32          next; /* next slot index in bucket chain, or -1 */
     BackendType    backend_type;
     Oid            dboid;
     Oid            userid;
@@ -78,6 +78,15 @@ typedef struct PgStatLogSlot
  * (average length = load factor) and stay O(1) expected even at full load.
  * Links are array indices (not pointers), so the block is snapshot- and
  * persistence-safe.  Use the accessors below to reach each sub-array.
+ *
+ * Why not a standard PostgreSQL hash table?  The fixed-amount custom stats
+ * API snapshots this block with a raw memcpy and persists/restores it
+ * verbatim (fwrite/fread) with no serialize callbacks, so everything in the
+ * block must be position-independent and self-contained.  dynahash chains
+ * entries with raw pointers, simplehash is process-local and grows by
+ * reallocation, and dshash would require switching to variable-amount stats
+ * (64-bit key limit, unbounded DSA growth, no extension-visible enumeration,
+ * and allocation inside emit_log_hook).  See "Design notes" in README.md.
  */
 typedef struct PgStatLog
 {
@@ -517,9 +526,8 @@ _PG_init(void)
     MarkGUCPrefixReserved("pg_stat_log");
 
     /* Compute sizes based on pg_stat_log.max_entries */
-    stats_block_size = offsetof(PgStatLog, data)
-        + sizeof(PgStatLogSlot) * (Size) pg_stat_log_max
-        + sizeof(int32) * (Size) pg_stat_log_max;
+    stats_block_size = offsetof(PgStatLog, data) + sizeof(PgStatLogSlot) * (Size) pg_stat_log_max +
+                       sizeof(int32) * (Size) pg_stat_log_max;
 
     shared_size = offsetof(PgStatLogShared, data) + stats_block_size;
 

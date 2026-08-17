@@ -190,6 +190,32 @@ same pattern as PostgreSQL's in-tree `test_custom_fixed_stats` test module.
    from the pgstat snapshot. The `pg_stat_log` view joins its output with
    `pg_database` and `pg_roles` to resolve OIDs to names.
 
+### Design notes: why a custom hash table
+
+The entries live in an index-based separate-chaining hash table built directly
+inside the stats block, rather than in one of PostgreSQL's standard hash
+tables. The reason is a hard constraint of the fixed-amount custom stats API:
+the block is snapshotted with a raw `memcpy` and persisted/restored verbatim
+(`fwrite`/`fread`) with no serialize callbacks, so every structure inside it
+must be position-independent (no raw pointers) and fully self-contained.
+
+None of the standard tables meet that bar. `dynahash` chains its entries,
+segment directory, and freelists with absolute pointers, which become garbage
+in a memcpy'd snapshot or after a restart (this is why `pg_stat_statements`
+serializes its dynahash logically at shutdown instead of dumping it raw --
+an option fixed-amount stats kinds do not have). `simplehash` is process-local
+and grows by reallocation, so it cannot live in shared memory at all. `dshash`
+would require abandoning the fixed-amount API for variable-amount stats, which
+brings a 64-bit key limit (pg_stat_log's signature needs ~148 bits), unbounded
+DSA memory growth, no extension-visible API to enumerate entries for
+reporting, and memory allocation inside `emit_log_hook` -- which runs in every
+process type, including the postmaster.
+
+The index-chained design sidesteps all of this: chain links are array indices
+instead of pointers, so the block survives snapshots and restarts unchanged;
+the footprint is a hard cap of ~1.15x the raw entry data, fixed at startup;
+and lookups, inserts, and drops stay O(1) expected even at 100% load.
+
 ## Caveats
 
 A few things to keep in mind when interpreting the counters:
@@ -223,7 +249,6 @@ A few things to keep in mind when interpreting the counters:
   cover the cardinality you expect -- roughly
   `N_databases x N_roles x typical_distinct_sqlstates x backend_types` --
   and remember it is `POSTMASTER`-context, so changes require a restart.
-
 
 - **`n_dropped` and `stats_reset` do not persist across restarts.** These
   metadata fields are reinitialized at server startup. The per-combination
