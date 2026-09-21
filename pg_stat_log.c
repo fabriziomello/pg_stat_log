@@ -523,7 +523,7 @@ _PG_init(void)
                             NULL,
                             NULL);
 
-    MarkGUCPrefixReserved("pg_stat_log");
+    MarkGUCPrefixReserved(PGSTAT_LOG_MODULE_NAME);
 
     /* Compute sizes based on pg_stat_log.max_entries */
     stats_block_size = offsetof(PgStatLog, data) + sizeof(PgStatLogSlot) * (Size) pg_stat_log_max +
@@ -534,7 +534,7 @@ _PG_init(void)
     /* Fill in the KindInfo struct — use memcpy because .name is const */
     {
         PgStat_KindInfo tmp = {
-            .name            = "pg_stat_log",
+            .name            = PGSTAT_LOG_MODULE_NAME,
             .fixed_amount    = true,
             .write_to_file   = true,
             .shared_size     = shared_size,
