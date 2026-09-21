@@ -656,10 +656,6 @@ pg_stat_log_info(PG_FUNCTION_ARGS)
     PgStatLog       *s;
     Datum            values[4];
     bool             nulls[4] = {0};
-    int              max_entries;
-    int              num_entries;
-    uint64           n_dropped;
-    TimestampTz      stat_reset_timestamp;
 
     InitMaterializedSRF(fcinfo, 0);
 
@@ -667,16 +663,11 @@ pg_stat_log_info(PG_FUNCTION_ARGS)
     s     = pg_stat_log_get_stats(shmem);
 
     LWLockAcquire(&shmem->lock, LW_SHARED);
-    max_entries          = s->max_entries;
-    num_entries          = s->num_entries;
-    n_dropped            = shmem->n_dropped;
-    stat_reset_timestamp = shmem->stat_reset_timestamp;
+    values[0] = Int32GetDatum(s->max_entries);
+    values[1] = Int32GetDatum(s->num_entries);
+    values[2] = Int64GetDatum((int64) shmem->n_dropped);
+    values[3] = TimestampTzGetDatum(shmem->stat_reset_timestamp);
     LWLockRelease(&shmem->lock);
-
-    values[0] = Int32GetDatum(max_entries);
-    values[1] = Int32GetDatum(num_entries);
-    values[2] = Int64GetDatum((int64) n_dropped);
-    values[3] = TimestampTzGetDatum(stat_reset_timestamp);
 
     tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 
