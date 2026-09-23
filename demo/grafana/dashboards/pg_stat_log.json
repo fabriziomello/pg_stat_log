@@ -70,12 +70,85 @@
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 7,
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (backend_type, elevel, sqlerrcode, sqlerrcode_name) (rate(pg_stat_log_count[1m]))",
+          "legendFormat": "{{backend_type}} {{elevel}} {{sqlerrcode}} {{sqlerrcode_name}}",
+          "refId": "A"
+        }
+      ],
+      "title": "All log messages",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value" },
+            "properties": [{ "id": "displayName", "value": "count" }]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 8,
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "count", "desc": true }]
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (backend_type, elevel, sqlerrcode, sqlerrcode_name) (pg_stat_log_count)",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "title": "All log messages (snapshot)",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true },
+            "indexByName": {
+              "backend_type": 0,
+              "elevel": 1,
+              "sqlerrcode": 2,
+              "sqlerrcode_name": 3,
+              "Value": 4
+            }
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
           "custom": { "drawStyle": "bars", "fillOpacity": 40, "lineWidth": 1 },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 8 },
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 16 },
       "id": 3,
       "targets": [
         {
@@ -91,7 +164,7 @@
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 8 },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 16 },
       "id": 4,
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal" },
       "targets": [
@@ -108,7 +181,7 @@
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 8 },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 16 },
       "id": 5,
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
       "targets": [
@@ -125,7 +198,7 @@
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": { "defaults": { "max": 1, "min": 0, "unit": "percentunit" }, "overrides": [] },
-      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 12 },
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 20 },
       "id": 6,
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
       "targets": [

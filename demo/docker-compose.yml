@@ -9,6 +9,10 @@ services:
       - shared_preload_libraries=pg_stat_log
       - -c
       - log_min_messages=warning
+      - -c
+      - pg_stat_log.min_error_level=log
+      - -c
+      - max_connections=300
     ports:
       - "5432:5432"
     healthcheck:
