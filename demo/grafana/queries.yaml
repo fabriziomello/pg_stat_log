@@ -1,0 +1,49 @@
+pg_stat_log:
+  query: |
+    SELECT
+      coalesce(database_name, 'none') AS database_name,
+      coalesce(user_name, 'none') AS user_name,
+      elevel,
+      sqlerrcode,
+      coalesce(sqlerrcode_name, '') AS sqlerrcode_name,
+      count
+    FROM pg_stat_log
+    WHERE elevel IN ('WARNING', 'ERROR', 'FATAL', 'PANIC')
+  master: true
+  cache_seconds: 0
+  metrics:
+    - database_name:
+        usage: "LABEL"
+        description: "Database name (none if unset)"
+    - user_name:
+        usage: "LABEL"
+        description: "Role name (none if unset)"
+    - elevel:
+        usage: "LABEL"
+        description: "Log severity"
+    - sqlerrcode:
+        usage: "LABEL"
+        description: "SQLSTATE"
+    - sqlerrcode_name:
+        usage: "LABEL"
+        description: "SQLSTATE name"
+    - count:
+        usage: "COUNTER"
+        description: "Cumulative log-message count from pg_stat_log"
+
+pg_stat_log_info:
+  query: |
+    SELECT max_entries, num_entries, n_dropped
+    FROM pg_stat_log_info()
+  master: true
+  cache_seconds: 0
+  metrics:
+    - max_entries:
+        usage: "GAUGE"
+        description: "pg_stat_log.max_entries"
+    - num_entries:
+        usage: "GAUGE"
+        description: "Distinct combinations currently tracked"
+    - n_dropped:
+        usage: "COUNTER"
+        description: "Messages dropped because the table was full"
