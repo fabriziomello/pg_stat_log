@@ -1,6 +1,7 @@
 pg_stat_log:
   query: |
     SELECT
+      backend_type,
       coalesce(database_name, 'none') AS database_name,
       coalesce(user_name, 'none') AS user_name,
       elevel,
@@ -8,10 +9,12 @@ pg_stat_log:
       coalesce(sqlerrcode_name, '') AS sqlerrcode_name,
       count
     FROM pg_stat_log
-    WHERE elevel IN ('WARNING', 'ERROR', 'FATAL', 'PANIC')
   master: true
   cache_seconds: 0
   metrics:
+    - backend_type:
+        usage: "LABEL"
+        description: "Backend type"
     - database_name:
         usage: "LABEL"
         description: "Database name (none if unset)"

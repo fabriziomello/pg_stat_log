@@ -21,7 +21,20 @@ docker compose up --build
 ```
 
 Open **http://127.0.0.1:3000** (anonymous admin). The provisioned dashboard is
-`pg_stat_log`.
+`pg_stat_log`. Collection uses `pg_stat_log.min_error_level=log` so LOG and
+above are counted. `log_min_messages` stays at **warning**: in PostgreSQL,
+`log_min_messages=log` is a special rank that *drops* WARNING and ERROR from
+the server log (only LOG/FATAL/PANIC remain), so the hook would never see
+the workload errors. LOG messages such as checkpoints still reach the hook
+when `log_min_messages` is warning. The error-rate graphs still filter
+`ERROR|FATAL|PANIC`; **All log messages** is the unfiltered group-by
+(`backend_type`, `elevel`, SQLSTATE), matching:
+
+```sql
+SELECT backend_type, elevel, sqlerrcode, sqlerrcode_name, sum(count)
+FROM pg_stat_log
+GROUP BY 1, 2, 3, 4;
+```
 
 First start initializes the data volume. Later starts reuse it; to wipe
 counters and data:
@@ -61,19 +74,23 @@ docker compose exec postgres psql -U postgres -c 'SELECT pg_stat_log_reset();'
 
 | Service | Role |
 |---------|------|
-| `postgres` | Official `postgres:18` + `apt install postgresql-18-stat-log`, `shared_preload_libraries=pg_stat_log` |
-| `workload_shop` | Infinite loop as `app_shop` / `shop` |
+| `postgres` | Official `postgres:18` + PGDG `postgresql-18-stat-log`, `min_error_level=log`, `max_connections=300` |
+| `workload_shop` | pgbench bursts as `app_shop` / `shop` (random `-c` 1..50) |
 | `workload_analytics` | Same for `app_analytics` / `analytics` |
 | `postgres_exporter` | Scrapes `pg_stat_log` (`count` as a COUNTER) and `pg_stat_log_info` |
 | `prometheus` | 5s scrape |
 | `grafana` | Dashboard on port 3000 |
 
-Each workload iteration is roughly:
+Each workload is an infinite loop of **pgbench bursts**. Every burst picks
+`-c` uniformly in 1..50 and runs **one transaction per client** (pgbench
+aborts a client on SQL ERROR, so a long mixed `-T` run would collapse to
+healthy-only). Script weights are ~80% healthy and ~15% real errors (`22012`,
+`23505`, `42P01`, `RAISE WARNING` — no `EXCEPTION` handler). Failed logins
+are occasional `psql` attempts between bursts (FATAL; names often NULL),
+because pgbench cannot authenticate as the wrong user mid-session.
 
-- 80% healthy `SELECT`/`INSERT` (should not log WARNING/ERROR)
-- 15% a real failure: `22012`, `23505`, `42P01`, or `RAISE WARNING` (no
-  `EXCEPTION` handler — caught errors never reach `emit_log_hook`)
-- 5% failed login (FATAL; `database_name` / `user_name` often NULL)
+`max_connections=300` leaves room for two tenants at 50 clients plus exporter
+and `psql`.
 
 Ports on the host: Postgres `5432`, Grafana `3000`, Prometheus `9090`,
 exporter `9187`. Demo passwords: `postgres` / `shop` / `analytics` /
@@ -83,9 +100,10 @@ exporter `9187`. Demo passwords: `postgres` / `shop` / `analytics` /
 
 | Path | Role |
 |------|------|
-| `Dockerfile` | `postgres:18` + PGDG `postgresql-18-stat-log` |
+| `Dockerfile` | `postgres:18` + PGDG `postgresql-18-stat-log` and `postgresql-contrib-18` |
 | `initdb/` | `CREATE EXTENSION`, tenants, seed row |
 | `docker-compose.yml` | Full stack |
-| `workload/loop.sh` | Infinite mixed load |
-| `workload/healthy.sql` | Non-error statements |
+| `workload/loop.sh` | Infinite pgbench bursts, random `-c` 1..50, then failed logins |
+| `workload/healthy.sql` | Non-error pgbench script (`@80`) |
+| `workload/error_*.sql` | Log-producing pgbench scripts |
 | `grafana/` | Exporter queries, Prometheus, provisioned dashboard |
