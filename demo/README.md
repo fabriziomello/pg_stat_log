@@ -7,8 +7,8 @@ Grafana. Counters in `pg_stat_log` are **cumulative**; the dashboard uses
 functions.
 
 ```
-workload_shop \                  postgres_exporter
-workload_analytics  -->  Postgres 18 + pg_stat_log  -->  Prometheus --> Grafana :3000
+app_shop \                  postgres_exporter
+app_analytics  -->  Postgres 18 + pg_stat_log  -->  Prometheus --> Grafana :3000
 ```
 
 ## Start
@@ -53,9 +53,9 @@ and start again.
 
 1. Grafana: both `shop` and `analytics` series should move (error rate by
    database and by user).
-2. Isolate a tenant: `docker compose stop workload_analytics` — shop keeps
+2. Isolate a tenant: `docker compose stop app_analytics` — shop keeps
    rising, analytics goes quiet.
-3. Bring it back: `docker compose start workload_analytics`.
+3. Bring it back: `docker compose start app_analytics`.
 4. Same numbers in SQL (no log file):
 
 ```bash
@@ -75,8 +75,8 @@ docker compose exec postgres psql -U postgres -c 'SELECT pg_stat_log_reset();'
 | Service | Role |
 |---------|------|
 | `postgres` | Official `postgres:18` + PGDG `postgresql-18-stat-log`, `min_error_level=log`, `max_connections=300` |
-| `workload_shop` | pgbench bursts as `app_shop` / `shop` (random `-c` 1..50) |
-| `workload_analytics` | Same for `app_analytics` / `analytics` |
+| `app_shop` | pgbench bursts as role `app_shop` / database `shop` (random `-c` 1..50) |
+| `app_analytics` | Same for `app_analytics` / `analytics` |
 | `postgres_exporter` | Scrapes `pg_stat_log` (`count` as a COUNTER) and `pg_stat_log_info` |
 | `prometheus` | 5s scrape |
 | `grafana` | Dashboard on port 3000 |
