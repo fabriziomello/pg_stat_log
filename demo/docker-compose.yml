@@ -23,7 +23,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql
 
-  workload_shop:
+  app_shop:
     build: .
     depends_on:
       postgres:
@@ -36,7 +36,7 @@ services:
     entrypoint: ["/demo/loop.sh"]
     restart: unless-stopped
 
-  workload_analytics:
+  app_analytics:
     build: .
     depends_on:
       postgres:
