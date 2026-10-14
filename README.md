@@ -22,6 +22,10 @@ Counters are exposed through the `pg_stat_log` view and the underlying
 are discarded after crash recovery, following standard PostgreSQL cumulative
 stats semantics.
 
+The records written by `log_connections` and `log_disconnections` are counted
+under their own SQLSTATEs; see
+[Connection lifecycle records](#connection-lifecycle-records).
+
 The extension uses custom stats kind ID **28**, registered on the
 [PostgreSQL wiki](https://wiki.postgresql.org/wiki/CustomCumulativeStats).
 
@@ -130,6 +134,70 @@ WHERE backend_type <> 'client backend'
 ORDER BY count DESC;
 ```
 
+### Connection lifecycle records
+
+PostgreSQL writes the `log_connections` and `log_disconnections` records at
+`LOG` level with SQLSTATE `00000`. `pg_stat_log` counts them under
+extension-defined SQLSTATEs instead, attributed to the connected database and
+the login role:
+
+| SQLSTATE | `sqlerrcode_name` | Record | Logged when |
+|----------|-------------------|--------|-------------|
+| `PSL01` | `connection_authenticated` | `connection authenticated: ...` | `log_connections` includes `authentication` |
+| `PSL02` | `connection_authorized` | `connection authorized: ...`, `replication connection authorized: ...` | `log_connections` includes `authorization` |
+| `PSL03` | `disconnection` | `disconnection: session time: ...` | `log_disconnections = on` |
+
+A record is counted only if it reaches the server log, and only if
+`pg_stat_log.min_error_level` is `log` or lower:
+
+```
+# postgresql.conf
+pg_stat_log.min_error_level = 'log'
+log_connections = 'authentication,authorization'    # or 'on', 'all'
+log_disconnections = on
+```
+
+Connections and disconnections per database and user:
+
+```sql
+SELECT database_name, user_name, backend_type, sqlerrcode_name, count
+FROM pg_stat_log
+WHERE sqlerrcode LIKE 'PSL%'
+ORDER BY database_name, user_name, backend_type, sqlerrcode;
+```
+
+- **The user is the login role**, the role that connected, even if the
+  session later runs `SET ROLE` or `SET SESSION AUTHORIZATION`.
+- **Physical replication connections** are counted with
+  `backend_type = 'walsender'` and a NULL database.
+- **A startup that fails after authentication** counts the records logged so
+  far with the attribution known at that point. For example, a connection to a
+  database that does not exist counts `PSL01` and `PSL02` with a NULL
+  database, and no `PSL03`, since its disconnection is not logged.
+- **Counting is not simultaneous with logging.** `PSL01` and `PSL02` are
+  counted when backend startup completes or fails; `PSL03` is counted as the
+  session exits, just before its record is written.
+- **Per-session settings only apply at connection start.** Superusers and
+  roles granted `SET` on `log_disconnections` can change it for a session
+  with startup options, such as `PGOPTIONS='-c log_disconnections=on'` or the
+  `options` connection parameter. `ALTER ROLE ... SET` and
+  `ALTER DATABASE ... SET` cannot set it. A configuration reload does not
+  change it for running sessions, so PostgreSQL still logs, and pg_stat_log
+  still counts, the disconnection of a session that started with
+  `log_disconnections = on`. Startup options for `log_connections` come too
+  late for `PSL01` and `PSL02`: PostgreSQL logs those records before it
+  applies the options.
+- **The other `log_connections` records are not mapped.** `receipt`
+  (`connection received: ...`) is logged before the backend has a `PGPROC` and
+  is never counted; `setup_durations` (`connection ready: ...`) is counted as
+  an ordinary `LOG` record with SQLSTATE `00000`.
+- **Each (backend type, database, user) combination** that connects can use up
+  to three entries; account for them when sizing `pg_stat_log.max_entries`.
+
+In version 0.1, the authenticated and authorized records were counted as
+`00000` (`successful_completion`) with a NULL database and user, and
+disconnections were not counted.
+
 ### Resetting statistics
 
 ```sql
@@ -190,6 +258,18 @@ same pattern as PostgreSQL's in-tree `test_custom_fixed_stats` test module.
    from the pgstat snapshot. The `pg_stat_log` view joins its output with
    `pg_database` and `pg_roles` to resolve OIDs to names.
 
+5. **Connection lifecycle records**: the hook recognizes the
+   `log_connections` and `log_disconnections` records by the source file and
+   function that emit them. Authentication and authorization are logged before
+   the session has a database and login role, so they are held in
+   backend-local counters and counted when the startup transaction commits or
+   aborts. The disconnection record is logged after the backend has released
+   its `PGPROC`, when shared memory can no longer be locked, so a
+   `before_shmem_exit` callback counts it just before, under the same
+   conditions that decide whether the record reaches the server log.
+   `check-upstream-anchors.pl` verifies in CI that the PostgreSQL sources still
+   match these assumptions.
+
 ### Design notes: why a custom hash table
 
 The entries live in an index-based separate-chaining hash table built directly
@@ -234,6 +314,8 @@ A few things to keep in mind when interpreting the counters:
   (e.g. FATAL with SQLSTATE `28P01`), early startup messages, and messages
   logged in the postmaster context. This is not a bug -- those rows record
   real events that simply have no database/user to attribute them to.
+  Connection lifecycle records of a failed startup follow the same rule; see
+  [Connection lifecycle records](#connection-lifecycle-records).
 
 - **Parallel workers appear as a separate `backend_type`.** If an error is
   raised during a parallel query, you may see one row with
@@ -270,7 +352,9 @@ A few things to keep in mind when interpreting the counters:
 | `pg_stat_log.control` | Extension metadata |
 | `Makefile` | PGXS build |
 | `generate-errcode-names.pl` | Generates SQLSTATE-to-name lookup header from `errcodes.txt` |
+| `check-upstream-anchors.pl` | Checks the PostgreSQL source assumptions behind the connection lifecycle counters |
 | `t/001_pg_stat_log.pl` | TAP regression tests |
+| `t/002_connection_lifecycle.pl` | TAP tests for the connection lifecycle counters |
 
 ## License
 

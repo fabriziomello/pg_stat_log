@@ -6,6 +6,10 @@
  * Hooks into emit_log_hook to count log messages grouped by
  * (elevel, sqlerrcode, database_oid, user_oid, backend_type).
  *
+ * Connection lifecycle records written by log_connections and
+ * log_disconnections are counted under extension-defined SQLSTATEs
+ * (PSL01-PSL03), attributed to the connected database and login role.
+ *
  * Uses the fixed-amount Custom Cumulative Stats API introduced in
  * PostgreSQL 18, following the same pattern as test_custom_fixed_stats.c.
  *
@@ -22,9 +26,11 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "access/xact.h"
 #include "common/hashfn.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
+#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/errcodes.h"
 #include "utils/guc.h"
@@ -49,6 +55,14 @@ PG_MODULE_MAGIC_EXT(.name = PGSTAT_LOG_MODULE_NAME, .version = PG_VERSION);
 #define PGSTAT_LOG_MAX_DEFAULT 1024
 #define PGSTAT_LOG_MIN_ENTRIES 64
 #define PGSTAT_LOG_MAX_ENTRIES (PGSTAT_LOG_MAX_DEFAULT * PGSTAT_LOG_MAX_DEFAULT)
+
+/*
+ * Extension-defined SQLSTATEs for connection lifecycle records, which
+ * PostgreSQL logs as 00000. Class "PS" is unused by core errcodes.txt.
+ */
+#define PGSTAT_LOG_ERRCODE_CONNECTION_AUTHENTICATED MAKE_SQLSTATE('P', 'S', 'L', '0', '1')
+#define PGSTAT_LOG_ERRCODE_CONNECTION_AUTHORIZED    MAKE_SQLSTATE('P', 'S', 'L', '0', '2')
+#define PGSTAT_LOG_ERRCODE_DISCONNECTION            MAKE_SQLSTATE('P', 'S', 'L', '0', '3')
 
 /*
  * Data structures
@@ -111,6 +125,43 @@ typedef struct PgStatLogShared
 } PgStatLogShared;
 
 /*
+ * Connection lifecycle records. PostgreSQL logs them at LOG without an
+ * errcode, so they are recognized by the function that emits them.
+ */
+typedef enum PgStatLogLifecycleEvent
+{
+    PGSTAT_LOG_EVENT_AUTHENTICATED,
+    PGSTAT_LOG_EVENT_AUTHORIZED,
+    PGSTAT_LOG_EVENT_DISCONNECTION,
+    PGSTAT_LOG_NUM_EVENTS
+} PgStatLogLifecycleEvent;
+
+typedef struct PgStatLogLifecycleOrigin
+{
+    const char             *filename;
+    const char             *funcname;
+    PgStatLogLifecycleEvent event;
+} PgStatLogLifecycleOrigin;
+
+/* Keep in sync with check-upstream-anchors.pl */
+static const PgStatLogLifecycleOrigin pg_stat_log_lifecycle_origins[] = {
+    {"auth.c",     "set_authn_id",          PGSTAT_LOG_EVENT_AUTHENTICATED},
+    {"auth.c",     "ClientAuthentication",  PGSTAT_LOG_EVENT_AUTHENTICATED},
+    {"postinit.c", "PerformAuthentication", PGSTAT_LOG_EVENT_AUTHORIZED   },
+    {"postgres.c", "log_disconnections",    PGSTAT_LOG_EVENT_DISCONNECTION},
+};
+
+/* Indexed by PgStatLogLifecycleEvent */
+static const PgStatLogErrCode pg_stat_log_lifecycle_codes[] = {
+    {PGSTAT_LOG_ERRCODE_CONNECTION_AUTHENTICATED, "connection_authenticated"},
+    {PGSTAT_LOG_ERRCODE_CONNECTION_AUTHORIZED,    "connection_authorized"   },
+    {PGSTAT_LOG_ERRCODE_DISCONNECTION,            "disconnection"           },
+};
+
+StaticAssertDecl(lengthof(pg_stat_log_lifecycle_codes) == PGSTAT_LOG_NUM_EVENTS,
+                 "pg_stat_log_lifecycle_codes must match PgStatLogLifecycleEvent");
+
+/*
  * GUC variables
  */
 static bool pg_stat_log_enabled    = true;
@@ -128,6 +179,12 @@ static Size stats_block_size; /* one PgStatLog block */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static emit_log_hook_type      prev_emit_log_hook      = NULL;
 static bool                    in_emit_log_hook        = false;
+
+/*
+ * Connection events logged before the session's database and login role are
+ * known; counted at the end of the startup transaction.
+ */
+static int pending_connection_events[PGSTAT_LOG_NUM_EVENTS];
 
 /*
  * Accessor helpers
@@ -156,6 +213,11 @@ pg_stat_log_heads(PgStatLog *s)
 static const char *
 pg_stat_log_errcode_name(int sqlerrcode)
 {
+    for (int i = 0; i < PGSTAT_LOG_NUM_EVENTS; i++)
+    {
+        if (pg_stat_log_lifecycle_codes[i].sqlerrcode == sqlerrcode)
+            return pg_stat_log_lifecycle_codes[i].name;
+    }
     for (int i = 0; pg_stat_log_errcodes[i].name != NULL; i++)
     {
         if (pg_stat_log_errcodes[i].sqlerrcode == sqlerrcode)
@@ -330,7 +392,7 @@ pg_stat_log_snapshot_cb(void)
 }
 
 /*
- * pg_stat_log_count_message — record one log message in shared memory
+ * pg_stat_log_count — record one log message in shared memory
  *
  * Acquires the LWLock, walks the hash bucket chain to find or create the
  * entry, increments the counter, and releases the lock. The chain walk is
@@ -338,15 +400,12 @@ pg_stat_log_snapshot_cb(void)
  * insert, and drop, even when the table is full.
  */
 static void
-pg_stat_log_count_message(ErrorData *edata)
+pg_stat_log_count(BackendType backend_type, Oid dboid, Oid userid, int elevel, int sqlerrcode)
 {
     PgStatLogShared *shmem;
     PgStatLog       *s;
     PgStatLogSlot   *entries;
     int32           *heads;
-    Oid              dboid;
-    Oid              userid;
-    int              sec_context;
     uint32           hash;
     uint32           bucket;
     int32            idx;
@@ -354,16 +413,13 @@ pg_stat_log_count_message(ErrorData *edata)
 
     shmem = (PgStatLogShared *) pgstat_get_custom_shmem_data(PGSTAT_KIND_LOG);
 
-    dboid = MyDatabaseId;
-    GetUserIdAndSecContext(&userid, &sec_context);
-
     LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
 
     s       = pg_stat_log_get_stats(shmem);
     entries = pg_stat_log_entries(s);
     heads   = pg_stat_log_heads(s);
 
-    hash   = pg_stat_log_hash_key(MyBackendType, dboid, userid, edata->elevel, edata->sqlerrcode);
+    hash   = pg_stat_log_hash_key(backend_type, dboid, userid, elevel, sqlerrcode);
     bucket = hash % s->max_entries;
 
     found = false;
@@ -371,8 +427,8 @@ pg_stat_log_count_message(ErrorData *edata)
     {
         PgStatLogSlot *slot = &entries[idx];
 
-        if (slot->backend_type == MyBackendType && slot->dboid == dboid && slot->userid == userid &&
-            slot->elevel == edata->elevel && slot->sqlerrcode == edata->sqlerrcode)
+        if (slot->backend_type == backend_type && slot->dboid == dboid && slot->userid == userid &&
+            slot->elevel == elevel && slot->sqlerrcode == sqlerrcode)
         {
             pgstat_begin_changecount_write(&shmem->changecount);
             slot->count++;
@@ -390,11 +446,11 @@ pg_stat_log_count_message(ErrorData *edata)
             PgStatLogSlot *slot   = &entries[newidx];
 
             pgstat_begin_changecount_write(&shmem->changecount);
-            slot->backend_type = MyBackendType;
+            slot->backend_type = backend_type;
             slot->dboid        = dboid;
             slot->userid       = userid;
-            slot->elevel       = edata->elevel;
-            slot->sqlerrcode   = edata->sqlerrcode;
+            slot->elevel       = elevel;
+            slot->sqlerrcode   = sqlerrcode;
             slot->count        = 1;
             slot->next         = heads[bucket];
             heads[bucket]      = newidx;
@@ -408,6 +464,142 @@ pg_stat_log_count_message(ErrorData *edata)
     }
 
     LWLockRelease(&shmem->lock);
+}
+
+/*
+ * pg_stat_log_classify_lifecycle — recognize connection lifecycle records
+ *
+ * elog.c has already reduced edata->filename to its base name.
+ */
+static bool
+pg_stat_log_classify_lifecycle(const ErrorData *edata, PgStatLogLifecycleEvent *event)
+{
+    if (edata->elevel != LOG || edata->sqlerrcode != ERRCODE_SUCCESSFUL_COMPLETION ||
+        edata->filename == NULL || edata->funcname == NULL)
+        return false;
+
+    for (int i = 0; i < lengthof(pg_stat_log_lifecycle_origins); i++)
+    {
+        const PgStatLogLifecycleOrigin *origin = &pg_stat_log_lifecycle_origins[i];
+
+        if (strcmp(edata->funcname, origin->funcname) == 0 &&
+            strcmp(edata->filename, origin->filename) == 0)
+        {
+            *event = origin->event;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
+ * pg_stat_log_record_message — count one message that reached the server log
+ *
+ * The connection authenticated/authorized records are logged before the
+ * session's database and login role are known, so they are held until
+ * pg_stat_log_startup_xact_cb. The disconnection record is logged after
+ * ProcKill, when shared memory can no longer be locked, so
+ * pg_stat_log_disconnect_cb counts it ahead of time instead.
+ */
+static void
+pg_stat_log_record_message(ErrorData *edata)
+{
+    PgStatLogLifecycleEvent event;
+    Oid                     userid;
+    int                     sec_context;
+
+    if (pg_stat_log_classify_lifecycle(edata, &event))
+    {
+        if (event != PGSTAT_LOG_EVENT_DISCONNECTION)
+            pending_connection_events[event]++;
+        return;
+    }
+
+    GetUserIdAndSecContext(&userid, &sec_context);
+    pg_stat_log_count(MyBackendType, MyDatabaseId, userid, edata->elevel, edata->sqlerrcode);
+}
+
+/*
+ * pg_stat_log_log_reaches_server — would a LOG record reach the server log?
+ *
+ * Mirrors is_log_level_output() in elog.c; check-upstream-anchors.pl
+ * verifies in CI that the rule is unchanged.
+ */
+static bool
+pg_stat_log_log_reaches_server(void)
+{
+#if PG_VERSION_NUM >= 190000
+    int min_level = log_min_messages[MyBackendType];
+#else
+    int min_level = log_min_messages;
+#endif
+
+    return min_level == LOG || min_level <= ERROR;
+}
+
+/*
+ * pg_stat_log_disconnect_cb — before_shmem_exit callback that counts the
+ * disconnection record
+ *
+ * Runs before ShutdownPostgres, pgstat_shutdown_hook and ProcKill, while the
+ * process still has its PGPROC, and applies the same conditions that decide
+ * whether log_disconnections' record reaches the server log.
+ */
+static void
+pg_stat_log_disconnect_cb(int code, Datum arg)
+{
+    /* PostgresMain installs log_disconnections only after InitPostgres() */
+    if (!IsNormalProcessingMode())
+        return;
+
+    if (!pg_stat_log_enabled || LOG < pg_stat_log_min_elevel || !pg_stat_log_log_reaches_server())
+        return;
+
+    pg_stat_log_count(MyBackendType,
+                      MyDatabaseId,
+                      MyProc->roleId,
+                      LOG,
+                      PGSTAT_LOG_ERRCODE_DISCONNECTION);
+}
+
+/*
+ * pg_stat_log_startup_xact_cb — attribute connection lifecycle events
+ *
+ * The first transaction a client backend or walsender ends is the startup
+ * transaction of InitPostgres(). It commits once the login role, the database
+ * and the startup options are all set, or aborts when startup fails with a
+ * FATAL error, in which case only part of the attribution may be known.
+ * MyProc->roleId is the login role; it is set before the remaining login
+ * checks can fail.
+ */
+static void
+pg_stat_log_startup_xact_cb(XactEvent event, void *arg)
+{
+    if (event != XACT_EVENT_PRE_COMMIT && event != XACT_EVENT_ABORT)
+        return;
+
+    UnregisterXactCallback(pg_stat_log_startup_xact_cb, NULL);
+
+    if (!IsExternalConnectionBackend(MyBackendType))
+        return;
+
+    for (int i = 0; i < PGSTAT_LOG_NUM_EVENTS; i++)
+    {
+        for (; pending_connection_events[i] > 0; pending_connection_events[i]--)
+            pg_stat_log_count(MyBackendType,
+                              MyDatabaseId,
+                              MyProc->roleId,
+                              LOG,
+                              pg_stat_log_lifecycle_codes[i].sqlerrcode);
+    }
+
+    /*
+     * Log_disconnections is final from here on; a configuration reload does
+     * not change it in a running backend.
+     */
+    if (event == XACT_EVENT_PRE_COMMIT && IsUnderPostmaster && Log_disconnections)
+        before_shmem_exit(pg_stat_log_disconnect_cb, 0);
 }
 
 /*
@@ -436,7 +628,7 @@ pg_stat_log_emit_hook(ErrorData *edata)
             prev_emit_log_hook(edata);
 
         if (pg_stat_log_enabled && edata->elevel >= pg_stat_log_min_elevel)
-            pg_stat_log_count_message(edata);
+            pg_stat_log_record_message(edata);
     }
     PG_FINALLY();
     {
@@ -561,6 +753,9 @@ _PG_init(void)
     /* Install emit_log_hook */
     prev_emit_log_hook = emit_log_hook;
     emit_log_hook      = pg_stat_log_emit_hook;
+
+    /* Attribute connection lifecycle events once backend startup completes */
+    RegisterXactCallback(pg_stat_log_startup_xact_cb, NULL);
 }
 
 /*
