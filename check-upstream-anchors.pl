@@ -1,13 +1,14 @@
 #!/usr/bin/perl
 #
 # Check the PostgreSQL source assumptions behind the connection lifecycle
-# counters
+# counters and the query identifiers
 #
 # pg_stat_log recognizes the log_connections and log_disconnections records
 # by the functions that emit them, attributes them when the startup
 # transaction ends, and relies on log_disconnections keeping its startup
 # value for the rest of the session. At exit, it predicts whether the
-# disconnection record reaches the server log. Each check names the
+# disconnection record reaches the server log. It records the query
+# identifier that log_line_prefix's %Q prints. Each check names the
 # assumption it guards; a failure means pg_stat_log.c must be revisited for
 # that PostgreSQL version.
 #
@@ -115,6 +116,12 @@ my @function_checks = (
 		function => 'is_log_level_output',
 		contains => ['if (log_min_level == LOG || log_min_level <= ERROR)'],
 		why => 'pg_stat_log_log_reaches_server() mirrors the LOG output rule',
+	},
+	{
+		file => 'src/backend/utils/error/elog.c',
+		function => 'log_status_format',
+		contains => ['pgstat_get_my_query_id()'],
+		why => 'query_id is the identifier that %Q prints',
 	},
 );
 

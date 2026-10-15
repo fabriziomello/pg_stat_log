@@ -16,6 +16,8 @@ grouped by:
 - **user** -- which role was active
 - **error level** -- WARNING, ERROR, FATAL, PANIC, etc.
 - **SQLSTATE code** -- the 5-character error code and its human-readable name
+- **query identifier** -- optionally, the statement that logged the message;
+  see [Query identifiers](#query-identifiers)
 
 Counters are exposed through the `pg_stat_log` view and the underlying
 `pg_stat_log_data()` function. Statistics persist across clean restarts and
@@ -63,6 +65,30 @@ Restart the server and create the extension:
 CREATE EXTENSION pg_stat_log;
 ```
 
+## Upgrading from 0.1
+
+Version 0.2 adds the `query_id` column and counts
+[connection lifecycle records](#connection-lifecycle-records) under their own
+SQLSTATEs. Install the new version, restart the server so it loads the new
+library, then update the extension in each database where it is installed:
+
+```sql
+ALTER EXTENSION pg_stat_log UPDATE;
+```
+
+- **The first start with the new library discards all cumulative
+  statistics**, not only pg_stat_log's. Version 0.2 stores a query identifier
+  in every entry, so PostgreSQL cannot read the statistics file written with
+  0.1: it logs a `could not read ...` warning and `corrupted statistics file`,
+  and starts over with every cumulative statistic reset. Later clean restarts
+  keep statistics as usual.
+- **Until the update, the 0.1 view and function keep working** with the new
+  library, without the `query_id` column.
+- **The update recreates the `pg_stat_log` view and the `pg_stat_log_data()`
+  function.** Drop your own views that depend on them before the update and
+  create them again afterwards. Privileges you granted on them must be granted
+  again; the default grants to `pg_read_all_stats` are restored.
+
 ## Configuration
 
 | Parameter | Type | Default | Context | Description |
@@ -70,6 +96,7 @@ CREATE EXTENSION pg_stat_log;
 | `pg_stat_log.enabled` | bool | `true` | SUSET | Enable or disable collection at runtime |
 | `pg_stat_log.min_error_level` | enum | `warning` | SUSET | Minimum severity to track (`debug5` through `panic`) |
 | `pg_stat_log.max_entries` | int | `1024` | POSTMASTER | Maximum distinct combinations to track; requires restart |
+| `pg_stat_log.compute_query_id` | bool | `off` | POSTMASTER | Also group by query identifier; see [Query identifiers](#query-identifiers) |
 
 ## Usage
 
@@ -82,11 +109,11 @@ SELECT * FROM pg_stat_log;
 ```
 
 ```
- backend_type   | database_oid | database_name | user_oid | user_name | elevel  | sqlerrcode | sqlerrcode_name  | count
-----------------+--------------+---------------+----------+-----------+---------+------------+------------------+-------
- client backend |        16384 | mydb          |       10 | postgres  | WARNING | 01000      | warning          |    42
- client backend |        16384 | mydb          |       10 | postgres  | ERROR   | 22012      | division_by_zero |     3
- client backend |        16384 | mydb          |       10 | postgres  | ERROR   | 42P01      | undefined_table  |     7
+ backend_type   | database_oid | database_name | user_oid | user_name | query_id | elevel  | sqlerrcode | sqlerrcode_name  | count
+----------------+--------------+---------------+----------+-----------+----------+---------+------------+------------------+-------
+ client backend |        16384 | mydb          |       10 | postgres  |          | WARNING | 01000      | warning          |    42
+ client backend |        16384 | mydb          |       10 | postgres  |          | ERROR   | 22012      | division_by_zero |     3
+ client backend |        16384 | mydb          |       10 | postgres  |          | ERROR   | 42P01      | undefined_table  |     7
 ```
 
 ### View columns
@@ -98,6 +125,7 @@ SELECT * FROM pg_stat_log;
 | `database_name` | text | Resolved database name |
 | `user_oid` | oid | Role OID, NULL for background processes |
 | `user_name` | text | Resolved role name |
+| `query_id` | bigint | Query identifier, NULL unless `pg_stat_log.compute_query_id` is on; see [Query identifiers](#query-identifiers) |
 | `elevel` | text | Error severity (WARNING, ERROR, FATAL, PANIC, ...) |
 | `sqlerrcode` | text | 5-character SQLSTATE code |
 | `sqlerrcode_name` | text | Condition name (e.g. `division_by_zero`) |
@@ -198,6 +226,56 @@ In version 0.1, the authenticated and authorized records were counted as
 `00000` (`successful_completion`) with a NULL database and user, and
 disconnections were not counted.
 
+### Query identifiers
+
+With `pg_stat_log.compute_query_id = on`, messages are also grouped by the
+query identifier of the statement that logged them, so the same error raised
+by different statements is counted in separate rows:
+
+```
+# postgresql.conf
+pg_stat_log.compute_query_id = on
+compute_query_id = auto    # the default; 'on' also works
+```
+
+`query_id` is the identifier that `%Q` prints in `log_line_prefix`, the same
+one shown by `pg_stat_activity.query_id` and `pg_stat_statements.queryid`.
+Errors per statement, with the statement text from `pg_stat_statements`:
+
+```sql
+SELECT l.sqlerrcode_name, l.count, s.query
+FROM pg_stat_log l
+LEFT JOIN pg_stat_statements s
+       ON s.queryid = l.query_id
+      AND s.dbid = l.database_oid
+      AND s.userid = l.user_oid
+      AND s.toplevel
+WHERE l.query_id IS NOT NULL
+ORDER BY l.count DESC;
+```
+
+`pg_stat_statements` lists a statement only after it has completed once, so
+`query` is NULL for statements that always fail.
+
+- **`compute_query_id` must not be `off`.** Under `auto`, pg_stat_log has
+  PostgreSQL compute query identifiers, as `pg_stat_statements` does; it
+  decides this at server start, so `pg_stat_log.compute_query_id` requires a
+  restart. While `compute_query_id` is `off`, in the server configuration or
+  in a session, messages are counted with a NULL `query_id`.
+- **Some messages have no query identifier** and are counted with a NULL
+  `query_id`: messages logged outside any statement, for example by the
+  checkpointer or during connection startup; errors raised before parse
+  analysis completes, such as syntax errors and references to tables that do
+  not exist; the connection lifecycle records; and every message while
+  `track_activities` is off.
+- **Statements that differ only in constants share an identifier**, such as
+  `SELECT 1/0` and `SELECT 2/0`.
+- **Messages from nested statements**, such as an error raised inside a
+  function, are counted under the identifier of the top-level statement.
+- **An idle session keeps its last statement's identifier.** A message logged
+  between statements, such as an `idle_session_timeout` FATAL, is counted
+  under the identifier of the session's most recent statement.
+
 ### Resetting statistics
 
 ```sql
@@ -245,9 +323,11 @@ same pattern as PostgreSQL's in-tree `test_custom_fixed_stats` test module.
 
 2. **Hook** (`emit_log_hook`): on each log message at or above the configured
    minimum level, acquires a shared-memory LWLock, scans the entry array for a
-   matching (backend_type, database, user, elevel, sqlerrcode) combination,
-   and either increments an existing counter or creates a new entry. Uses the
-   changecount protocol for atomic reads.
+   matching (backend_type, database, user, query_id, elevel, sqlerrcode)
+   combination, and either increments an existing counter or creates a new
+   entry. `query_id` is 0, shown as NULL, unless
+   `pg_stat_log.compute_query_id` is on. Uses the changecount protocol for
+   atomic reads.
 
 3. **pgstat callbacks**: three callbacks mirror the test module --
    `init_shmem_cb` initializes the LWLock and array header,
@@ -286,7 +366,7 @@ serializes its dynahash logically at shutdown instead of dumping it raw --
 an option fixed-amount stats kinds do not have). `simplehash` is process-local
 and grows by reallocation, so it cannot live in shared memory at all. `dshash`
 would require abandoning the fixed-amount API for variable-amount stats, which
-brings a 64-bit key limit (pg_stat_log's signature needs ~148 bits), unbounded
+brings a 64-bit key limit (pg_stat_log's signature needs ~212 bits), unbounded
 DSA memory growth, no extension-visible API to enumerate entries for
 reporting, and memory allocation inside `emit_log_hook` -- which runs in every
 process type, including the postmaster.
@@ -324,13 +404,21 @@ A few things to keep in mind when interpreting the counters:
   in mind when aggregating so you do not double-count a single logical error.
 
 - **`max_entries` is a hard cap.** Once the configured number of distinct
-  (backend_type, database, user, elevel, sqlerrcode) combinations has been
-  reached, new distinct combinations are dropped until `pg_stat_log_reset()`
-  is called, which reclaims all slots. Monitor `n_dropped` via
-  `pg_stat_log_info()` to detect when `max_entries` is too small. Size it to
-  cover the cardinality you expect -- roughly
+  (backend_type, database, user, query_id, elevel, sqlerrcode) combinations
+  has been reached, new distinct combinations are dropped until
+  `pg_stat_log_reset()` is called, which reclaims all slots. Monitor
+  `n_dropped` via `pg_stat_log_info()` to detect when `max_entries` is too
+  small. Size it to cover the cardinality you expect -- roughly
   `N_databases x N_roles x typical_distinct_sqlstates x backend_types` --
   and remember it is `POSTMASTER`-context, so changes require a restart.
+  With `pg_stat_log.compute_query_id = on`, multiply that by the number of
+  distinct statements that log messages.
+
+- **Changing `max_entries` discards all cumulative statistics.** The
+  persisted block changes length, so at the next start PostgreSQL cannot
+  read the statistics file: it logs a `could not read ...` warning and
+  `corrupted statistics file`, and starts over with every cumulative
+  statistic reset, not only pg_stat_log's.
 
 - **`n_dropped` and `stats_reset` do not persist across restarts.** These
   metadata fields are reinitialized at server startup. The per-combination
@@ -348,13 +436,15 @@ A few things to keep in mind when interpreting the counters:
 | File | Purpose |
 |------|---------|
 | `pg_stat_log.c` | C implementation (hook, callbacks, SQL functions) |
-| `pg_stat_log--1.0.sql` | SQL objects (functions, view) |
+| `pg_stat_log--0.1.sql` | SQL objects (functions, view) |
+| `pg_stat_log--0.1--0.2.sql` | Update to 0.2, adding the `query_id` column |
 | `pg_stat_log.control` | Extension metadata |
 | `Makefile` | PGXS build |
 | `generate-errcode-names.pl` | Generates SQLSTATE-to-name lookup header from `errcodes.txt` |
-| `check-upstream-anchors.pl` | Checks the PostgreSQL source assumptions behind the connection lifecycle counters |
+| `check-upstream-anchors.pl` | Checks the PostgreSQL source assumptions behind the connection lifecycle counters and query identifiers |
 | `t/001_pg_stat_log.pl` | TAP regression tests |
 | `t/002_connection_lifecycle.pl` | TAP tests for the connection lifecycle counters |
+| `t/003_query_id.pl` | TAP tests for the query identifiers |
 
 ## License
 

@@ -247,4 +247,58 @@ $num_entries = $node->safe_psql('postgres', q(
 ));
 ok($num_entries > 0, "new entries tracked after max_entries change");
 
+# ---------------------------------------------------------------
+# Test 7: Stats discarded when max_entries is lowered across restart
+# ---------------------------------------------------------------
+
+# A different max_entries changes the length of the persisted block, so
+# PostgreSQL cannot parse the stats file and resets every stats kind. The
+# reset must size the block from the new max_entries, not from the header
+# restored from the file, or it writes past the smaller block.
+$node->safe_psql('postgres', q{
+	CREATE TABLE core_stats (i int);
+	INSERT INTO core_stats SELECT generate_series(1, 10);
+});
+$result = $node->safe_psql('postgres', q(
+	SELECT n_tup_ins FROM pg_stat_user_tables WHERE relname = 'core_stats'
+));
+is($result, "10", "core statistics recorded before restart");
+
+$node->stop;
+$node->append_conf('postgresql.conf', "pg_stat_log.max_entries = 64");
+my $log_offset = -s $node->logfile;
+$node->start;
+
+$result = $node->safe_psql('postgres', q(
+	SELECT n_tup_ins FROM pg_stat_user_tables WHERE relname = 'core_stats'
+));
+is($result, "0", "core statistics discarded along with pg_stat_log's");
+
+$max_entries = $node->safe_psql('postgres', q(
+	SELECT max_entries FROM pg_stat_log_info()
+));
+is($max_entries, "64", "max_entries reflects the lowered GUC after restart");
+
+$num_entries = $node->safe_psql('postgres', q(
+	SELECT num_entries FROM pg_stat_log_info()
+));
+is($num_entries, "0",
+	"persisted stats discarded after lowering max_entries");
+
+ok($node->log_contains(qr/corrupted statistics file/, $log_offset),
+	"stats file written with the old max_entries is discarded");
+ok( !$node->log_contains(
+		qr/pg_stat_log: discarding persisted stats/, $log_offset),
+	"reset sized the block from the new max_entries");
+
+$node->safe_psql('postgres', q{
+	DO $$ BEGIN RAISE WARNING 'after shrink'; END $$;
+});
+$node->safe_psql('postgres', q(SELECT pg_stat_force_next_flush()));
+
+$num_entries = $node->safe_psql('postgres', q(
+	SELECT num_entries FROM pg_stat_log_info()
+));
+ok($num_entries > 0, "new entries tracked after lowering max_entries");
+
 done_testing();
