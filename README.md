@@ -65,23 +65,25 @@ Restart the server and create the extension:
 CREATE EXTENSION pg_stat_log;
 ```
 
-## Upgrading from 0.1
+## Upgrading from 0.1 or 0.2
 
-Version 0.2 adds the `query_id` column and counts
+Version 0.3 adds the `query_id` column and counts
 [connection lifecycle records](#connection-lifecycle-records) under their own
-SQLSTATEs. Install the new version, restart the server so it loads the new
-library, then update the extension in each database where it is installed:
+SQLSTATEs. Releases 0.1 and 0.2 both install the extension's SQL version 0.1
+(`pg_extension.extversion` shows `0.1`), so the update goes straight to 0.3.
+Install the new version, restart the server so it loads the new library, then
+update the extension in each database where it is installed:
 
 ```sql
 ALTER EXTENSION pg_stat_log UPDATE;
 ```
 
 - **The first start with the new library discards all cumulative
-  statistics**, not only pg_stat_log's. Version 0.2 stores a query identifier
+  statistics**, not only pg_stat_log's. Version 0.3 stores a query identifier
   in every entry, so PostgreSQL cannot read the statistics file written with
-  0.1: it logs a `could not read ...` warning and `corrupted statistics file`,
-  and starts over with every cumulative statistic reset. Later clean restarts
-  keep statistics as usual.
+  0.1 or 0.2: it logs a `could not read ...` warning and
+  `corrupted statistics file`, and starts over with every cumulative
+  statistic reset. Later clean restarts keep statistics as usual.
 - **Until the update, the 0.1 view and function keep working** with the new
   library, without the `query_id` column.
 - **The update recreates the `pg_stat_log` view and the `pg_stat_log_data()`
@@ -222,7 +224,7 @@ ORDER BY database_name, user_name, backend_type, sqlerrcode;
 - **Each (backend type, database, user) combination** that connects can use up
   to three entries; account for them when sizing `pg_stat_log.max_entries`.
 
-In version 0.1, the authenticated and authorized records were counted as
+Before version 0.3, the authenticated and authorized records were counted as
 `00000` (`successful_completion`) with a NULL database and user, and
 disconnections were not counted.
 
@@ -437,7 +439,7 @@ A few things to keep in mind when interpreting the counters:
 |------|---------|
 | `pg_stat_log.c` | C implementation (hook, callbacks, SQL functions) |
 | `pg_stat_log--0.1.sql` | SQL objects (functions, view) |
-| `pg_stat_log--0.1--0.2.sql` | Update to 0.2, adding the `query_id` column |
+| `pg_stat_log--0.1--0.3.sql` | Update to 0.3, adding the `query_id` column |
 | `pg_stat_log.control` | Extension metadata |
 | `Makefile` | PGXS build |
 | `generate-errcode-names.pl` | Generates SQLSTATE-to-name lookup header from `errcodes.txt` |

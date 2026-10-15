@@ -43,7 +43,7 @@
 #include "pg_stat_log_errcodes.h"
 
 #define PGSTAT_LOG_MODULE_NAME  "pg_stat_log"
-#define PGSTAT_LOG_VERSION      "0.2" /* default_version in pg_stat_log.control */
+#define PGSTAT_LOG_VERSION      "0.3" /* default_version in pg_stat_log.control */
 #define PGSTAT_LOG_TRANCHE_NAME PGSTAT_LOG_MODULE_NAME
 
 PG_MODULE_MAGIC_EXT(.name = PGSTAT_LOG_MODULE_NAME, .version = PGSTAT_LOG_VERSION);
@@ -71,11 +71,11 @@ PG_MODULE_MAGIC_EXT(.name = PGSTAT_LOG_MODULE_NAME, .version = PGSTAT_LOG_VERSIO
 typedef enum PgStatLogApiVersion
 {
     PGSTAT_LOG_V0_1,
-    PGSTAT_LOG_V0_2,
+    PGSTAT_LOG_V0_3,
 } PgStatLogApiVersion;
 
 #define PGSTAT_LOG_DATA_COLS_V0_1 7
-#define PGSTAT_LOG_DATA_COLS_V0_2 8
+#define PGSTAT_LOG_DATA_COLS_V0_3 8
 #define PGSTAT_LOG_DATA_COLS      8 /* maximum of above */
 
 /*
@@ -819,7 +819,7 @@ _PG_init(void)
  * SQL-callable functions
  */
 PG_FUNCTION_INFO_V1(pg_stat_log_data);
-PG_FUNCTION_INFO_V1(pg_stat_log_data_0_2);
+PG_FUNCTION_INFO_V1(pg_stat_log_data_0_3);
 
 /*
  * pg_stat_log_data_internal
@@ -841,7 +841,7 @@ pg_stat_log_data_internal(FunctionCallInfo fcinfo, PgStatLogApiVersion api_versi
     InitMaterializedSRF(fcinfo, 0);
 
     expected_cols =
-        api_version == PGSTAT_LOG_V0_1 ? PGSTAT_LOG_DATA_COLS_V0_1 : PGSTAT_LOG_DATA_COLS_V0_2;
+        api_version == PGSTAT_LOG_V0_1 ? PGSTAT_LOG_DATA_COLS_V0_1 : PGSTAT_LOG_DATA_COLS_V0_3;
     if (rsinfo->setDesc->natts != expected_cols)
         elog(ERROR, "incorrect number of output arguments");
 
@@ -872,7 +872,7 @@ pg_stat_log_data_internal(FunctionCallInfo fcinfo, PgStatLogApiVersion api_versi
             nulls[col] = true;
         col++;
 
-        if (api_version >= PGSTAT_LOG_V0_2)
+        if (api_version >= PGSTAT_LOG_V0_3)
         {
             if (slot->queryid != 0)
                 values[col] = Int64GetDatum(slot->queryid);
@@ -901,7 +901,7 @@ pg_stat_log_data_internal(FunctionCallInfo fcinfo, PgStatLogApiVersion api_versi
 /*
  * pg_stat_log_data()
  *		The 0.1 definition, without query_id. Databases where the extension
- *		has not been updated to 0.2 still call it.
+ *		has not been updated to 0.3 still call it.
  */
 Datum
 pg_stat_log_data(PG_FUNCTION_ARGS)
@@ -911,13 +911,13 @@ pg_stat_log_data(PG_FUNCTION_ARGS)
 }
 
 /*
- * pg_stat_log_data_0_2()
- *		The 0.2 definition, with query_id.
+ * pg_stat_log_data_0_3()
+ *		The 0.3 definition, with query_id.
  */
 Datum
-pg_stat_log_data_0_2(PG_FUNCTION_ARGS)
+pg_stat_log_data_0_3(PG_FUNCTION_ARGS)
 {
-    pg_stat_log_data_internal(fcinfo, PGSTAT_LOG_V0_2);
+    pg_stat_log_data_internal(fcinfo, PGSTAT_LOG_V0_3);
     return (Datum) 0;
 }
 
