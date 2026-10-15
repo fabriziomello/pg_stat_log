@@ -4,7 +4,8 @@
  *		Cumulative statistics about log messages.
  *
  * Hooks into emit_log_hook to count log messages grouped by
- * (elevel, sqlerrcode, database_oid, user_oid, backend_type).
+ * (elevel, sqlerrcode, database_oid, user_oid, backend_type, query_id).
+ * The query identifier is tracked only with pg_stat_log.compute_query_id.
  *
  * Connection lifecycle records written by log_connections and
  * log_disconnections are counted under extension-defined SQLSTATEs
@@ -28,6 +29,7 @@
 #include "pgstat.h"
 #include "access/xact.h"
 #include "common/hashfn.h"
+#include "nodes/queryjumble.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
@@ -41,9 +43,10 @@
 #include "pg_stat_log_errcodes.h"
 
 #define PGSTAT_LOG_MODULE_NAME  "pg_stat_log"
+#define PGSTAT_LOG_VERSION      "0.2" /* default_version in pg_stat_log.control */
 #define PGSTAT_LOG_TRANCHE_NAME PGSTAT_LOG_MODULE_NAME
 
-PG_MODULE_MAGIC_EXT(.name = PGSTAT_LOG_MODULE_NAME, .version = PG_VERSION);
+PG_MODULE_MAGIC_EXT(.name = PGSTAT_LOG_MODULE_NAME, .version = PGSTAT_LOG_VERSION);
 
 /*
  * Custom stats kind ID — registered at
@@ -64,6 +67,17 @@ PG_MODULE_MAGIC_EXT(.name = PGSTAT_LOG_MODULE_NAME, .version = PG_VERSION);
 #define PGSTAT_LOG_ERRCODE_CONNECTION_AUTHORIZED    MAKE_SQLSTATE('P', 'S', 'L', '0', '2')
 #define PGSTAT_LOG_ERRCODE_DISCONNECTION            MAKE_SQLSTATE('P', 'S', 'L', '0', '3')
 
+/* Extension versions whose pg_stat_log_data() returns different columns */
+typedef enum PgStatLogApiVersion
+{
+    PGSTAT_LOG_V0_1,
+    PGSTAT_LOG_V0_2,
+} PgStatLogApiVersion;
+
+#define PGSTAT_LOG_DATA_COLS_V0_1 7
+#define PGSTAT_LOG_DATA_COLS_V0_2 8
+#define PGSTAT_LOG_DATA_COLS      8 /* maximum of above */
+
 /*
  * Data structures
  */
@@ -75,6 +89,7 @@ typedef struct PgStatLogSlot
     Oid            userid;
     int            elevel;
     int            sqlerrcode;
+    int64          queryid; /* 0 if not tracked */
     PgStat_Counter count;
 } PgStatLogSlot;
 
@@ -164,9 +179,10 @@ StaticAssertDecl(lengthof(pg_stat_log_lifecycle_codes) == PGSTAT_LOG_NUM_EVENTS,
 /*
  * GUC variables
  */
-static bool pg_stat_log_enabled    = true;
-static int  pg_stat_log_min_elevel = WARNING;
-static int  pg_stat_log_max        = PGSTAT_LOG_MAX_DEFAULT;
+static bool pg_stat_log_enabled          = true;
+static int  pg_stat_log_min_elevel       = WARNING;
+static int  pg_stat_log_max              = PGSTAT_LOG_MAX_DEFAULT;
+static bool pg_stat_log_compute_query_id = false;
 
 /*
  * Computed sizes (set in _PG_init based on pg_stat_log.max_entries)
@@ -231,7 +247,8 @@ pg_stat_log_errcode_name(int sqlerrcode)
  * used to pick a chain bucket (hash % max_entries).
  */
 static inline uint32
-pg_stat_log_hash_key(BackendType backend_type, Oid dboid, Oid userid, int elevel, int sqlerrcode)
+pg_stat_log_hash_key(BackendType backend_type, Oid dboid, Oid userid, int elevel, int sqlerrcode,
+                     int64 queryid)
 {
     uint32 h;
 
@@ -240,6 +257,7 @@ pg_stat_log_hash_key(BackendType backend_type, Oid dboid, Oid userid, int elevel
     h = hash_combine(h, murmurhash32((uint32) userid));
     h = hash_combine(h, murmurhash32((uint32) elevel));
     h = hash_combine(h, murmurhash32((uint32) sqlerrcode));
+    h = hash_combine(h, (uint32) murmurhash64((uint64) queryid));
     return h;
 }
 
@@ -258,9 +276,10 @@ static PgStat_KindInfo log_stats_kind;
  *
  * Runs in every backend after the stats file has been loaded by the
  * startup process. Validates that persisted max_entries matches the
- * current GUC. If pg_stat_log.max_entries was changed across a clean
- * restart, the restored stats block has a stale layout — discard and
- * reinitialize to prevent out-of-bounds access.
+ * current GUC. A changed pg_stat_log.max_entries changes the length of the
+ * persisted block, so PostgreSQL cannot parse the stats file, discards it
+ * and calls reset_all_cb, which rebuilds the block. This check is a safety
+ * net against a restored block with a stale layout.
  */
 static void
 pg_stat_log_init_backend_cb(void)
@@ -361,7 +380,12 @@ pg_stat_log_reset_all_cb(TimestampTz ts)
 
     LWLockAcquire(&shmem->lock, LW_EXCLUSIVE);
 
+    /*
+     * After a stats file fails to load, the header holds whatever was read
+     * from the file, so size the block from the GUC instead.
+     */
     pgstat_begin_changecount_write(&shmem->changecount);
+    s->max_entries = pg_stat_log_max;
     s->num_entries = 0;
     memset(pg_stat_log_heads(s), 0xFF, sizeof(int32) * (Size) s->max_entries);
     pgstat_end_changecount_write(&shmem->changecount);
@@ -400,7 +424,8 @@ pg_stat_log_snapshot_cb(void)
  * insert, and drop, even when the table is full.
  */
 static void
-pg_stat_log_count(BackendType backend_type, Oid dboid, Oid userid, int elevel, int sqlerrcode)
+pg_stat_log_count(BackendType backend_type, Oid dboid, Oid userid, int elevel, int sqlerrcode,
+                  int64 queryid)
 {
     PgStatLogShared *shmem;
     PgStatLog       *s;
@@ -419,7 +444,7 @@ pg_stat_log_count(BackendType backend_type, Oid dboid, Oid userid, int elevel, i
     entries = pg_stat_log_entries(s);
     heads   = pg_stat_log_heads(s);
 
-    hash   = pg_stat_log_hash_key(backend_type, dboid, userid, elevel, sqlerrcode);
+    hash   = pg_stat_log_hash_key(backend_type, dboid, userid, elevel, sqlerrcode, queryid);
     bucket = hash % s->max_entries;
 
     found = false;
@@ -428,7 +453,7 @@ pg_stat_log_count(BackendType backend_type, Oid dboid, Oid userid, int elevel, i
         PgStatLogSlot *slot = &entries[idx];
 
         if (slot->backend_type == backend_type && slot->dboid == dboid && slot->userid == userid &&
-            slot->elevel == elevel && slot->sqlerrcode == sqlerrcode)
+            slot->elevel == elevel && slot->sqlerrcode == sqlerrcode && slot->queryid == queryid)
         {
             pgstat_begin_changecount_write(&shmem->changecount);
             slot->count++;
@@ -451,6 +476,7 @@ pg_stat_log_count(BackendType backend_type, Oid dboid, Oid userid, int elevel, i
             slot->userid       = userid;
             slot->elevel       = elevel;
             slot->sqlerrcode   = sqlerrcode;
+            slot->queryid      = queryid;
             slot->count        = 1;
             slot->next         = heads[bucket];
             heads[bucket]      = newidx;
@@ -501,6 +527,9 @@ pg_stat_log_classify_lifecycle(const ErrorData *edata, PgStatLogLifecycleEvent *
  * pg_stat_log_startup_xact_cb. The disconnection record is logged after
  * ProcKill, when shared memory can no longer be locked, so
  * pg_stat_log_disconnect_cb counts it ahead of time instead.
+ *
+ * The query identifier is the one log_line_prefix's %Q prints: the current
+ * top-level statement's, or the session's most recent one while idle.
  */
 static void
 pg_stat_log_record_message(ErrorData *edata)
@@ -508,6 +537,7 @@ pg_stat_log_record_message(ErrorData *edata)
     PgStatLogLifecycleEvent event;
     Oid                     userid;
     int                     sec_context;
+    int64                   queryid = 0;
 
     if (pg_stat_log_classify_lifecycle(edata, &event))
     {
@@ -516,8 +546,16 @@ pg_stat_log_record_message(ErrorData *edata)
         return;
     }
 
+    if (pg_stat_log_compute_query_id && IsQueryIdEnabled())
+        queryid = pgstat_get_my_query_id();
+
     GetUserIdAndSecContext(&userid, &sec_context);
-    pg_stat_log_count(MyBackendType, MyDatabaseId, userid, edata->elevel, edata->sqlerrcode);
+    pg_stat_log_count(MyBackendType,
+                      MyDatabaseId,
+                      userid,
+                      edata->elevel,
+                      edata->sqlerrcode,
+                      queryid);
 }
 
 /*
@@ -556,11 +594,13 @@ pg_stat_log_disconnect_cb(int code, Datum arg)
     if (!pg_stat_log_enabled || LOG < pg_stat_log_min_elevel || !pg_stat_log_log_reaches_server())
         return;
 
+    /* The record is written after MyBEEntry is cleared, so its %Q is 0 */
     pg_stat_log_count(MyBackendType,
                       MyDatabaseId,
                       MyProc->roleId,
                       LOG,
-                      PGSTAT_LOG_ERRCODE_DISCONNECTION);
+                      PGSTAT_LOG_ERRCODE_DISCONNECTION,
+                      0);
 }
 
 /*
@@ -591,7 +631,8 @@ pg_stat_log_startup_xact_cb(XactEvent event, void *arg)
                               MyDatabaseId,
                               MyProc->roleId,
                               LOG,
-                              pg_stat_log_lifecycle_codes[i].sqlerrcode);
+                              pg_stat_log_lifecycle_codes[i].sqlerrcode,
+                              0);
     }
 
     /*
@@ -715,7 +756,23 @@ _PG_init(void)
                             NULL,
                             NULL);
 
+    DefineCustomBoolVariable("pg_stat_log.compute_query_id",
+                             "Tracks log messages per query identifier.",
+                             "Has no effect when compute_query_id is off. With auto, "
+                             "pg_stat_log enables query identifier computation.",
+                             &pg_stat_log_compute_query_id,
+                             false,
+                             PGC_POSTMASTER,
+                             0,
+                             NULL,
+                             NULL,
+                             NULL);
+
     MarkGUCPrefixReserved(PGSTAT_LOG_MODULE_NAME);
+
+    /* Like pg_stat_statements; a no-op when compute_query_id is off */
+    if (pg_stat_log_compute_query_id)
+        EnableQueryId();
 
     /* Compute sizes based on pg_stat_log.max_entries */
     stats_block_size = offsetof(PgStatLog, data) + sizeof(PgStatLogSlot) * (Size) pg_stat_log_max +
@@ -762,17 +819,20 @@ _PG_init(void)
  * SQL-callable functions
  */
 PG_FUNCTION_INFO_V1(pg_stat_log_data);
+PG_FUNCTION_INFO_V1(pg_stat_log_data_0_2);
 
 /*
- * pg_stat_log_data()
- *		Return all tracked log statistics as a set of rows.
+ * pg_stat_log_data_internal
+ *		Return all tracked log statistics as a set of rows, with the columns
+ *		of the given extension version.
  */
-Datum
-pg_stat_log_data(PG_FUNCTION_ARGS)
+static void
+pg_stat_log_data_internal(FunctionCallInfo fcinfo, PgStatLogApiVersion api_version)
 {
     ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
     PgStatLog     *snap;
     PgStatLogSlot *entries;
+    int            expected_cols;
     int            i;
 
     pgstat_snapshot_fixed(PGSTAT_KIND_LOG);
@@ -780,44 +840,84 @@ pg_stat_log_data(PG_FUNCTION_ARGS)
 
     InitMaterializedSRF(fcinfo, 0);
 
+    expected_cols =
+        api_version == PGSTAT_LOG_V0_1 ? PGSTAT_LOG_DATA_COLS_V0_1 : PGSTAT_LOG_DATA_COLS_V0_2;
+    if (rsinfo->setDesc->natts != expected_cols)
+        elog(ERROR, "incorrect number of output arguments");
+
     entries = pg_stat_log_entries(snap);
 
     for (i = 0; i < snap->num_entries; i++)
     {
-        Datum          values[7];
-        bool           nulls[7] = {0};
-        PgStatLogSlot *slot     = &entries[i];
+        Datum          values[PGSTAT_LOG_DATA_COLS];
+        bool           nulls[PGSTAT_LOG_DATA_COLS] = {0};
+        int            col                         = 0;
+        PgStatLogSlot *slot                        = &entries[i];
         const char    *errname;
 
         if (slot->count <= 0)
             continue;
 
-        values[0] = CStringGetTextDatum(GetBackendTypeDesc(slot->backend_type));
+        values[col++] = CStringGetTextDatum(GetBackendTypeDesc(slot->backend_type));
 
         if (OidIsValid(slot->dboid))
-            values[1] = ObjectIdGetDatum(slot->dboid);
+            values[col] = ObjectIdGetDatum(slot->dboid);
         else
-            nulls[1] = true;
+            nulls[col] = true;
+        col++;
 
         if (OidIsValid(slot->userid))
-            values[2] = ObjectIdGetDatum(slot->userid);
+            values[col] = ObjectIdGetDatum(slot->userid);
         else
-            nulls[2] = true;
+            nulls[col] = true;
+        col++;
 
-        values[3] = CStringGetTextDatum(error_severity(slot->elevel));
-        values[4] = CStringGetTextDatum(unpack_sql_state(slot->sqlerrcode));
+        if (api_version >= PGSTAT_LOG_V0_2)
+        {
+            if (slot->queryid != 0)
+                values[col] = Int64GetDatum(slot->queryid);
+            else
+                nulls[col] = true;
+            col++;
+        }
+
+        values[col++] = CStringGetTextDatum(error_severity(slot->elevel));
+        values[col++] = CStringGetTextDatum(unpack_sql_state(slot->sqlerrcode));
 
         errname = pg_stat_log_errcode_name(slot->sqlerrcode);
         if (errname)
-            values[5] = CStringGetTextDatum(errname);
+            values[col] = CStringGetTextDatum(errname);
         else
-            nulls[5] = true;
+            nulls[col] = true;
+        col++;
 
-        values[6] = Int64GetDatum(slot->count);
+        values[col++] = Int64GetDatum(slot->count);
 
+        Assert(col == expected_cols);
         tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
     }
+}
 
+/*
+ * pg_stat_log_data()
+ *		The 0.1 definition, without query_id. Databases where the extension
+ *		has not been updated to 0.2 still call it.
+ */
+Datum
+pg_stat_log_data(PG_FUNCTION_ARGS)
+{
+    pg_stat_log_data_internal(fcinfo, PGSTAT_LOG_V0_1);
+    return (Datum) 0;
+}
+
+/*
+ * pg_stat_log_data_0_2()
+ *		The 0.2 definition, with query_id.
+ */
+Datum
+pg_stat_log_data_0_2(PG_FUNCTION_ARGS)
+{
+    pg_stat_log_data_internal(fcinfo, PGSTAT_LOG_V0_2);
     return (Datum) 0;
 }
 
