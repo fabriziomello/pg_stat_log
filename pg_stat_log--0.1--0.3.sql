@@ -1,7 +1,7 @@
-/* pg_stat_log/pg_stat_log--0.1--0.2.sql */
+/* pg_stat_log/pg_stat_log--0.1--0.3.sql */
 
 -- complain if script is sourced in psql, rather than via ALTER EXTENSION
-\echo Use "ALTER EXTENSION pg_stat_log UPDATE TO '0.2'" to load this file. \quit
+\echo Use "ALTER EXTENSION pg_stat_log UPDATE TO '0.3'" to load this file. \quit
 
 -- First remove the objects whose columns change from the extension
 ALTER EXTENSION pg_stat_log DROP VIEW pg_stat_log;
@@ -23,7 +23,7 @@ CREATE FUNCTION pg_stat_log_data(
     OUT count bigint
 )
 RETURNS SETOF record
-AS 'MODULE_PATHNAME', 'pg_stat_log_data_0_2'
+AS 'MODULE_PATHNAME', 'pg_stat_log_data_0_3'
 LANGUAGE C STRICT PARALLEL UNSAFE;
 
 CREATE VIEW pg_stat_log AS
