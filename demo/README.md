@@ -1,7 +1,7 @@
 # Hands-on demo: live error rates from `pg_stat_log`
 
-Self-contained Docker Compose stack: PostgreSQL 18 with `pg_stat_log` from
-PGDG (`postgresql-18-stat-log`), two infinite mixed workloads, Prometheus, and
+Self-contained Docker Compose stack: PostgreSQL 18 with `pg_stat_log` built
+from this checkout, two infinite mixed workloads, Prometheus, and
 Grafana. Counters in `pg_stat_log` are **cumulative**; the dashboard uses
 `rate()` / `increase()`. Do not graph `sum(count)` as a rate without those
 functions.
@@ -13,12 +13,17 @@ app_analytics  -->  Postgres 18 + pg_stat_log  -->  Prometheus --> Grafana :3000
 
 ## Start
 
-Needs Docker Compose and a network for the image build (apt). From this
-directory:
+Needs Docker Compose and a network for the image build. A build stage installs
+a compiler and the PostgreSQL server headers (apt) and compiles `pg_stat_log`
+from the repository root; the image gets only the installed extension. From
+this directory:
 
 ```bash
 docker compose up --build
 ```
+
+Run it again after changing the extension's source: `--build` recompiles
+`pg_stat_log`.
 
 Open **http://127.0.0.1:3000** (anonymous admin). The provisioned dashboard is
 `pg_stat_log`. Collection uses `pg_stat_log.min_error_level=log` so LOG and
@@ -42,6 +47,16 @@ counters and data:
 ```bash
 docker compose down -v
 docker compose up --build
+```
+
+The volume also keeps the extension's SQL objects; the `initdb/` scripts run
+only on the first start. A volume created with an older version, such as
+PGDG's release 0.2, keeps SQL version 0.1 and works without the `query_id`
+column (see [Upgrading from 0.1 or 0.2](../README.md#upgrading-from-01-or-02)).
+Update the extension, or start over with `docker compose down -v`:
+
+```bash
+docker compose exec postgres psql -U postgres -c 'ALTER EXTENSION pg_stat_log UPDATE;'
 ```
 
 If Postgres exits complaining about data in `/var/lib/postgresql/data`
@@ -74,7 +89,7 @@ docker compose exec postgres psql -U postgres -c 'SELECT pg_stat_log_reset();'
 
 | Service | Role |
 |---------|------|
-| `postgres` | Official `postgres:18` + PGDG `postgresql-18-stat-log`, `min_error_level=log`, `max_connections=300` |
+| `postgres` | Official `postgres:18` + `pg_stat_log` built from this checkout, `min_error_level=log`, `max_connections=300` |
 | `app_shop` | pgbench bursts as role `app_shop` / database `shop` (random `-c` 1..50) |
 | `app_analytics` | Same for `app_analytics` / `analytics` |
 | `postgres_exporter` | Scrapes `pg_stat_log` (`count` as a COUNTER) and `pg_stat_log_info` |
@@ -100,7 +115,7 @@ exporter `9187`. Demo passwords: `postgres` / `shop` / `analytics` /
 
 | Path | Role |
 |------|------|
-| `Dockerfile` | `postgres:18` + PGDG `postgresql-18-stat-log` and `postgresql-contrib-18` |
+| `Dockerfile` | Builds `pg_stat_log` from the repository root and installs it on `postgres:18` |
 | `initdb/` | `CREATE EXTENSION`, tenants, seed row |
 | `docker-compose.yml` | Full stack |
 | `workload/loop.sh` | Infinite pgbench bursts, random `-c` 1..50, then failed logins |

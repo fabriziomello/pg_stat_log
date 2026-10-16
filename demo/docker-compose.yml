@@ -1,6 +1,8 @@
 services:
   postgres:
-    build: .
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile
     environment:
       POSTGRES_PASSWORD: postgres
     command:
@@ -24,7 +26,9 @@ services:
       - pgdata:/var/lib/postgresql
 
   app_shop:
-    build: .
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
@@ -37,7 +41,9 @@ services:
     restart: unless-stopped
 
   app_analytics:
-    build: .
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
