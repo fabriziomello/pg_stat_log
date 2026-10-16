@@ -26,12 +26,14 @@ while true; do
     # One transaction per client, then start over. pgbench aborts a client on
     # SQL ERROR, so a long -T mixed burst would shed error-producing clients
     # and the mix would collapse to healthy-only.
+    # error_div and error_unique fail on half of their runs, so @8 logs as
+    # often as error_undef's @4.
     pgbench -n \
         -h "$PGHOST" -U "$PGUSER" -d "$PGDATABASE" \
         -c "$clients" -j "$jobs" -t 1 --max-tries=1 \
-        -f "$SCRIPT_DIR/healthy.sql@80" \
-        -f "$SCRIPT_DIR/error_div.sql@4" \
-        -f "$SCRIPT_DIR/error_unique.sql@4" \
+        -f "$SCRIPT_DIR/healthy.sql@72" \
+        -f "$SCRIPT_DIR/error_div.sql@8" \
+        -f "$SCRIPT_DIR/error_unique.sql@8" \
         -f "$SCRIPT_DIR/error_undef.sql@4" \
         -f "$SCRIPT_DIR/error_warn.sql@3" \
         >/dev/null 2>&1 \

@@ -1,1 +1,2 @@
 CREATE EXTENSION IF NOT EXISTS pg_stat_log;
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;

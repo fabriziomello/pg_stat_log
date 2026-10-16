@@ -1,2 +1,4 @@
+-- Fails on half of the runs, so pg_stat_statements also has its text.
 SET client_min_messages TO error;
-SELECT 1 / 0;
+\set divisor random(0, 1)
+SELECT 1 / :divisor;

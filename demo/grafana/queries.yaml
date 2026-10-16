@@ -1,3 +1,6 @@
+# Each query returns one row per label set: rows that differ only in query_id,
+# or in a database or role without a name, would repeat one, and
+# postgres_exporter then fails the whole scrape.
 pg_stat_log:
   query: |
     SELECT
@@ -7,8 +10,9 @@ pg_stat_log:
       elevel,
       sqlerrcode,
       coalesce(sqlerrcode_name, '') AS sqlerrcode_name,
-      count
+      sum(count)::bigint AS count
     FROM pg_stat_log
+    GROUP BY 1, 2, 3, 4, 5, 6
   master: true
   cache_seconds: 0
   metrics:
@@ -33,6 +37,54 @@ pg_stat_log:
     - count:
         usage: "COUNTER"
         description: "Cumulative log-message count from pg_stat_log"
+
+pg_stat_log_query:
+  query: |
+    SELECT
+      l.query_id::text AS query_id,
+      coalesce(left(regexp_replace(s.query, '\s+', ' ', 'g'), 80),
+               'query_id ' || l.query_id) AS query,
+      coalesce(l.database_name, 'none') AS database_name,
+      coalesce(l.user_name, 'none') AS user_name,
+      l.elevel,
+      l.sqlerrcode,
+      coalesce(l.sqlerrcode_name, '') AS sqlerrcode_name,
+      sum(l.count)::bigint AS count
+    FROM pg_stat_log l
+    LEFT JOIN pg_stat_statements s
+           ON s.queryid = l.query_id
+          AND s.dbid = l.database_oid
+          AND s.userid = l.user_oid
+          AND s.toplevel
+    WHERE l.query_id IS NOT NULL
+    GROUP BY 1, 2, 3, 4, 5, 6, 7
+  master: true
+  cache_seconds: 0
+  metrics:
+    - query_id:
+        usage: "LABEL"
+        description: "Query identifier"
+    - query:
+        usage: "LABEL"
+        description: "Query text from pg_stat_statements, or query_id <id> until the statement has completed once"
+    - database_name:
+        usage: "LABEL"
+        description: "Database name (none if unset)"
+    - user_name:
+        usage: "LABEL"
+        description: "Role name (none if unset)"
+    - elevel:
+        usage: "LABEL"
+        description: "Log severity"
+    - sqlerrcode:
+        usage: "LABEL"
+        description: "SQLSTATE"
+    - sqlerrcode_name:
+        usage: "LABEL"
+        description: "SQLSTATE name"
+    - count:
+        usage: "COUNTER"
+        description: "Cumulative log-message count from pg_stat_log, per query identifier"
 
 pg_stat_log_info:
   query: |

@@ -41,6 +41,12 @@ FROM pg_stat_log
 GROUP BY 1, 2, 3, 4;
 ```
 
+The stack also sets `pg_stat_log.compute_query_id=on`, so each message is
+counted under the query identifier of the statement that logged it, and
+preloads `pg_stat_statements`, which supplies the statement text. The three
+panels at the bottom of the dashboard show messages per query (step 5 of the
+session); the other panels add the statements up.
+
 First start initializes the data volume. Later starts reuse it; to wipe
 counters and data:
 
@@ -52,11 +58,17 @@ docker compose up --build
 The volume also keeps the extension's SQL objects; the `initdb/` scripts run
 only on the first start. A volume created with an older version, such as
 PGDG's release 0.2, keeps SQL version 0.1 and works without the `query_id`
-column (see [Upgrading from 0.1 or 0.2](../README.md#upgrading-from-01-or-02)).
-Update the extension, or start over with `docker compose down -v`:
+column (see [Upgrading from 0.1 or 0.2](../README.md#upgrading-from-01-or-02)),
+but it may lack `pg_stat_statements`. Until you update the extension and
+create `pg_stat_statements`, the per-query panels stay empty, and the
+exporter's per-query query fails on every scrape, which the dashboard shows
+as `demo_monitor` errors. Run this, or start over with
+`docker compose down -v`:
 
 ```bash
-docker compose exec postgres psql -U postgres -c 'ALTER EXTENSION pg_stat_log UPDATE;'
+docker compose exec postgres psql -U postgres \
+  -c 'ALTER EXTENSION pg_stat_log UPDATE;' \
+  -c 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements;'
 ```
 
 If Postgres exits complaining about data in `/var/lib/postgresql/data`
@@ -79,6 +91,26 @@ docker compose exec postgres psql -U postgres -c \
    FROM pg_stat_log ORDER BY count DESC;"
 ```
 
+5. Per query: **Messages by query** splits the messages by statement, labeled
+   with the normalized text from `pg_stat_statements`, such as
+   `SELECT $1 / $2`. `42P01` (undefined table) fails during parse analysis,
+   before the statement gets a query identifier, and failed logins (`28P01`)
+   and checkpoints run no statement, so they count under **without query
+   id**. The same join in SQL:
+
+```bash
+docker compose exec postgres psql -U postgres -c \
+  "SELECT l.database_name, l.sqlerrcode_name, l.count, s.query
+   FROM pg_stat_log l
+   LEFT JOIN pg_stat_statements s
+          ON s.queryid = l.query_id
+         AND s.dbid = l.database_oid
+         AND s.userid = l.user_oid
+         AND s.toplevel
+   WHERE l.query_id IS NOT NULL
+   ORDER BY l.count DESC;"
+```
+
 Optional reset during the talk:
 
 ```bash
@@ -89,18 +121,21 @@ docker compose exec postgres psql -U postgres -c 'SELECT pg_stat_log_reset();'
 
 | Service | Role |
 |---------|------|
-| `postgres` | Official `postgres:18` + `pg_stat_log` built from this checkout, `min_error_level=log`, `max_connections=300` |
+| `postgres` | Official `postgres:18` + `pg_stat_log` built from this checkout, `min_error_level=log`, `compute_query_id=on`, `pg_stat_statements`, `max_connections=300` |
 | `app_shop` | pgbench bursts as role `app_shop` / database `shop` (random `-c` 1..50) |
 | `app_analytics` | Same for `app_analytics` / `analytics` |
-| `postgres_exporter` | Scrapes `pg_stat_log` (`count` as a COUNTER) and `pg_stat_log_info` |
+| `postgres_exporter` | Scrapes `pg_stat_log` (`count` as a COUNTER, summed over `query_id`), per-query counts with the text from `pg_stat_statements`, and `pg_stat_log_info` |
 | `prometheus` | 5s scrape |
 | `grafana` | Dashboard on port 3000 |
 
 Each workload is an infinite loop of **pgbench bursts**. Every burst picks
 `-c` uniformly in 1..50 and runs **one transaction per client** (pgbench
 aborts a client on SQL ERROR, so a long mixed `-T` run would collapse to
-healthy-only). Script weights are ~80% healthy and ~15% real errors (`22012`,
-`23505`, `42P01`, `RAISE WARNING` — no `EXCEPTION` handler). Failed logins
+healthy-only). Script weights are 72 healthy, 8 each for `22012` and `23505`,
+4 for `42P01` and 3 for `RAISE WARNING` (no `EXCEPTION` handler). The `22012`
+and `23505` scripts fail on half of their runs, so `pg_stat_statements` sees
+them complete and records their text; overall about 15% of transactions log
+an error or a warning. Failed logins
 are occasional `psql` attempts between bursts (FATAL; names often NULL),
 because pgbench cannot authenticate as the wrong user mid-session.
 
@@ -119,6 +154,6 @@ exporter `9187`. Demo passwords: `postgres` / `shop` / `analytics` /
 | `initdb/` | `CREATE EXTENSION`, tenants, seed row |
 | `docker-compose.yml` | Full stack |
 | `workload/loop.sh` | Infinite pgbench bursts, random `-c` 1..50, then failed logins |
-| `workload/healthy.sql` | Non-error pgbench script (`@80`) |
+| `workload/healthy.sql` | Non-error pgbench script (`@72`) |
 | `workload/error_*.sql` | Log-producing pgbench scripts |
 | `grafana/` | Exporter queries, Prometheus, provisioned dashboard |
