@@ -184,7 +184,64 @@ CREATE ROLE regress_pg_stat_log_user;
 SET ROLE regress_pg_stat_log_user;
 SELECT pg_stat_log_reset();
 ERROR:  permission denied for function pg_stat_log_reset
+SELECT pg_stat_log_audit_reset();
+ERROR:  permission denied for function pg_stat_log_audit_reset
 RESET ROLE;
 DROP ROLE regress_pg_stat_log_user;
+--
+-- Test 11: pg_stat_log.track_audit is off by default and can only be set in
+-- the server configuration
+--
+SHOW pg_stat_log.track_audit;
+ pg_stat_log.track_audit 
+-------------------------
+ off
+(1 row)
+
+SET pg_stat_log.track_audit = command;
+ERROR:  parameter "pg_stat_log.track_audit" cannot be changed now
+--
+-- Test 12: Nothing is tracked in pg_stat_log_audit without pgaudit
+--
+SELECT count(*) AS audit_rows FROM pg_stat_log_audit;
+ audit_rows 
+------------
+          0
+(1 row)
+
+SELECT max_entries = current_setting('pg_stat_log.audit_max_entries')::int AS audit_max_matches_guc,
+       num_entries, n_folded, n_dropped
+FROM pg_stat_log_audit_info();
+ audit_max_matches_guc | num_entries | n_folded | n_dropped 
+-----------------------+-------------+----------+-----------
+ t                     |           0 |        0 |         0
+(1 row)
+
+--
+-- Test 13: pg_stat_log_audit_reset() leaves pg_stat_log alone
+--
+DO $$ BEGIN RAISE WARNING 'kept by pg_stat_log_audit_reset'; END $$;
+WARNING:  kept by pg_stat_log_audit_reset
+SELECT stats_reset AS audit_reset_before FROM pg_stat_log_audit_info() \gset
+SELECT pg_stat_log_audit_reset();
+ pg_stat_log_audit_reset 
+-------------------------
+ 
+(1 row)
+
+SELECT stats_reset > :'audit_reset_before' AS audit_reset_ok FROM pg_stat_log_audit_info();
+ audit_reset_ok 
+----------------
+ t
+(1 row)
+
+SELECT count >= 1 AS warning_kept
+FROM pg_stat_log_data()
+WHERE elevel = 'WARNING' AND sqlerrcode = '01000';
+ warning_kept 
+--------------
+ t
+(1 row)
+
 -- Clean up
 DROP EXTENSION pg_stat_log;

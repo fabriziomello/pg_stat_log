@@ -1,8 +1,8 @@
 --
--- pg_stat_log upgrade from 0.1 to 0.3
+-- pg_stat_log upgrades from 0.1 to 0.3 and from 0.3 to 0.4
 --
 --
--- Test 1: The 0.1 objects keep working with the 0.3 library
+-- Test 1: The 0.1 objects keep working with the current library
 --
 CREATE EXTENSION pg_stat_log VERSION '0.1';
 SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_log';
@@ -43,9 +43,9 @@ WHERE sqlerrcode = '01000';
 (1 row)
 
 --
--- Test 2: ALTER EXTENSION UPDATE adds query_id
+-- Test 2: ALTER EXTENSION UPDATE TO '0.3' adds query_id
 --
-ALTER EXTENSION pg_stat_log UPDATE;
+ALTER EXTENSION pg_stat_log UPDATE TO '0.3';
 SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_log';
  extversion 
 ------------
@@ -124,5 +124,97 @@ LANGUAGE C STRICT;
 SELECT * FROM pg_stat_log_data_mismatch();
 ERROR:  incorrect number of output arguments
 DROP FUNCTION pg_stat_log_data_mismatch();
+--
+-- Test 5: ALTER EXTENSION UPDATE adds pg_stat_log_audit and leaves
+-- pg_stat_log as it was
+--
+ALTER EXTENSION pg_stat_log UPDATE;
+SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_log';
+ extversion 
+------------
+ 0.4
+(1 row)
+
+SELECT pg_get_function_arguments('pg_stat_log_data()'::regprocedure);
+                                                                      pg_get_function_arguments                                                                       
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ OUT backend_type text, OUT database_oid oid, OUT user_oid oid, OUT query_id bigint, OUT elevel text, OUT sqlerrcode text, OUT sqlerrcode_name text, OUT count bigint
+(1 row)
+
+SELECT attname
+FROM pg_attribute
+WHERE attrelid = 'pg_stat_log_audit'::regclass AND attnum > 0
+ORDER BY attnum;
+    attname    
+---------------
+ backend_type
+ database_oid
+ database_name
+ user_oid
+ user_name
+ query_id
+ audit_type
+ class
+ command
+ object_type
+ object_name
+ count
+(12 rows)
+
+SELECT pg_get_function_arguments('pg_stat_log_audit_info()'::regprocedure);
+                                                       pg_get_function_arguments                                                       
+---------------------------------------------------------------------------------------------------------------------------------------
+ OUT max_entries integer, OUT num_entries integer, OUT n_folded bigint, OUT n_dropped bigint, OUT stats_reset timestamp with time zone
+(1 row)
+
+SELECT pg_describe_object(classid, objid, objsubid) AS member
+FROM pg_depend
+WHERE refclassid = 'pg_extension'::regclass
+  AND refobjid = (SELECT oid FROM pg_extension WHERE extname = 'pg_stat_log')
+  AND deptype = 'e'
+  AND classid IN ('pg_proc'::regclass, 'pg_class'::regclass)
+ORDER BY member;
+               member               
+------------------------------------
+ function pg_stat_log_audit_data()
+ function pg_stat_log_audit_info()
+ function pg_stat_log_audit_reset()
+ function pg_stat_log_data()
+ function pg_stat_log_info()
+ function pg_stat_log_reset()
+ view pg_stat_log
+ view pg_stat_log_audit
+(8 rows)
+
+-- Counts recorded before the updates are kept
+SELECT backend_type, query_id, elevel, sqlerrcode, count
+FROM pg_stat_log
+WHERE sqlerrcode = '01000';
+  backend_type  | query_id | elevel  | sqlerrcode | count 
+----------------+----------+---------+------------+-------
+ client backend |          | WARNING | 01000      |     1
+(1 row)
+
+SELECT count(*) AS audit_rows FROM pg_stat_log_audit;
+ audit_rows 
+------------
+          0
+(1 row)
+
+--
+-- Test 6: The 0.4 objects have the privileges of their pg_stat_log
+-- counterparts
+--
+SELECT has_function_privilege('pg_read_all_stats', 'pg_stat_log_audit_data()', 'EXECUTE') AS read_all_stats_execute,
+       has_function_privilege('public', 'pg_stat_log_audit_data()', 'EXECUTE') AS public_execute,
+       has_table_privilege('pg_read_all_stats', 'pg_stat_log_audit', 'SELECT') AS read_all_stats_select,
+       has_table_privilege('public', 'pg_stat_log_audit', 'SELECT') AS public_select,
+       has_function_privilege('pg_read_all_stats', 'pg_stat_log_audit_info()', 'EXECUTE') AS read_all_stats_info,
+       has_function_privilege('pg_read_all_stats', 'pg_stat_log_audit_reset()', 'EXECUTE') AS read_all_stats_reset;
+ read_all_stats_execute | public_execute | read_all_stats_select | public_select | read_all_stats_info | read_all_stats_reset 
+------------------------+----------------+-----------------------+---------------+---------------------+----------------------
+ t                      | f              | t                     | f             | t                   | f
+(1 row)
+
 -- Clean up
 DROP EXTENSION pg_stat_log;

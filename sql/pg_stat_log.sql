@@ -112,8 +112,40 @@ FROM pg_stat_log_info();
 CREATE ROLE regress_pg_stat_log_user;
 SET ROLE regress_pg_stat_log_user;
 SELECT pg_stat_log_reset();
+SELECT pg_stat_log_audit_reset();
 RESET ROLE;
 DROP ROLE regress_pg_stat_log_user;
+
+--
+-- Test 11: pg_stat_log.track_audit is off by default and can only be set in
+-- the server configuration
+--
+SHOW pg_stat_log.track_audit;
+SET pg_stat_log.track_audit = command;
+
+--
+-- Test 12: Nothing is tracked in pg_stat_log_audit without pgaudit
+--
+SELECT count(*) AS audit_rows FROM pg_stat_log_audit;
+
+SELECT max_entries = current_setting('pg_stat_log.audit_max_entries')::int AS audit_max_matches_guc,
+       num_entries, n_folded, n_dropped
+FROM pg_stat_log_audit_info();
+
+--
+-- Test 13: pg_stat_log_audit_reset() leaves pg_stat_log alone
+--
+DO $$ BEGIN RAISE WARNING 'kept by pg_stat_log_audit_reset'; END $$;
+
+SELECT stats_reset AS audit_reset_before FROM pg_stat_log_audit_info() \gset
+
+SELECT pg_stat_log_audit_reset();
+
+SELECT stats_reset > :'audit_reset_before' AS audit_reset_ok FROM pg_stat_log_audit_info();
+
+SELECT count >= 1 AS warning_kept
+FROM pg_stat_log_data()
+WHERE elevel = 'WARNING' AND sqlerrcode = '01000';
 
 -- Clean up
 DROP EXTENSION pg_stat_log;

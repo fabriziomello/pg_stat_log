@@ -5,13 +5,17 @@ on:
     branches: [main]
     paths:
       - 'pg_stat_log.c'
+      - 'pg_stat_log_audit.c'
       - 'check-upstream-anchors.pl'
+      - 'check-pgaudit-anchors.pl'
       - '.github/workflows/upstream_anchors.yml'
   pull_request:
     branches: [main]
     paths:
       - 'pg_stat_log.c'
+      - 'pg_stat_log_audit.c'
       - 'check-upstream-anchors.pl'
+      - 'check-pgaudit-anchors.pl'
       - '.github/workflows/upstream_anchors.yml'
   schedule:
     - cron: '0 6 * * 1'
@@ -51,3 +55,29 @@ jobs:
             /src/include/utils/guc.h
       - name: Check upstream anchors
         run: perl check-upstream-anchors.pl postgres
+
+  pgaudit-anchors:
+    name: pgaudit ${{ matrix.ref }}
+    runs-on: ubuntu-latest
+    # main drifts independently of this repo; only the weekly run fails on it
+    continue-on-error: ${{ matrix.ref == 'main' && github.event_name != 'schedule' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [REL_18_STABLE, REL_19_STABLE, main]
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v5
+      - name: Check out pgaudit ${{ matrix.ref }}
+        uses: actions/checkout@v5
+        with:
+          repository: pgaudit/pgaudit
+          ref: ${{ matrix.ref }}
+          path: pgaudit
+          fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*.c
+            /pgaudit.control
+      - name: Check pgaudit anchors
+        run: perl check-pgaudit-anchors.pl pgaudit

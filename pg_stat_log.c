@@ -11,6 +11,9 @@
  * log_disconnections are counted under extension-defined SQLSTATEs
  * (PSL01-PSL03), attributed to the connected database and login role.
  *
+ * With pg_stat_log.track_audit, pgaudit audit records are counted in their
+ * own stats kind (see pg_stat_log_audit.c) and, here, under PSA01-PSA02.
+ *
  * Uses the fixed-amount Custom Cumulative Stats API introduced in
  * PostgreSQL 18, following the same pattern as test_custom_fixed_stats.c.
  *
@@ -40,10 +43,11 @@
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
+#include "pg_stat_log_audit.h"
 #include "pg_stat_log_errcodes.h"
 
 #define PGSTAT_LOG_MODULE_NAME  "pg_stat_log"
-#define PGSTAT_LOG_VERSION      "0.3" /* default_version in pg_stat_log.control */
+#define PGSTAT_LOG_VERSION      "0.4" /* default_version in pg_stat_log.control */
 #define PGSTAT_LOG_TRANCHE_NAME PGSTAT_LOG_MODULE_NAME
 
 PG_MODULE_MAGIC_EXT(.name = PGSTAT_LOG_MODULE_NAME, .version = PGSTAT_LOG_VERSION);
@@ -66,6 +70,13 @@ PG_MODULE_MAGIC_EXT(.name = PGSTAT_LOG_MODULE_NAME, .version = PGSTAT_LOG_VERSIO
 #define PGSTAT_LOG_ERRCODE_CONNECTION_AUTHENTICATED MAKE_SQLSTATE('P', 'S', 'L', '0', '1')
 #define PGSTAT_LOG_ERRCODE_CONNECTION_AUTHORIZED    MAKE_SQLSTATE('P', 'S', 'L', '0', '2')
 #define PGSTAT_LOG_ERRCODE_DISCONNECTION            MAKE_SQLSTATE('P', 'S', 'L', '0', '3')
+
+/*
+ * Extension-defined SQLSTATEs for pgaudit records, which pgaudit logs
+ * without an errcode, counted with pg_stat_log.track_audit
+ */
+#define PGSTAT_LOG_ERRCODE_AUDIT_SESSION MAKE_SQLSTATE('P', 'S', 'A', '0', '1')
+#define PGSTAT_LOG_ERRCODE_AUDIT_OBJECT  MAKE_SQLSTATE('P', 'S', 'A', '0', '2')
 
 /* Extension versions whose pg_stat_log_data() returns different columns */
 typedef enum PgStatLogApiVersion
@@ -176,6 +187,11 @@ static const PgStatLogErrCode pg_stat_log_lifecycle_codes[] = {
 StaticAssertDecl(lengthof(pg_stat_log_lifecycle_codes) == PGSTAT_LOG_NUM_EVENTS,
                  "pg_stat_log_lifecycle_codes must match PgStatLogLifecycleEvent");
 
+static const PgStatLogErrCode pg_stat_log_audit_codes[] = {
+    {PGSTAT_LOG_ERRCODE_AUDIT_SESSION, "audit_session"},
+    {PGSTAT_LOG_ERRCODE_AUDIT_OBJECT,  "audit_object" },
+};
+
 /*
  * GUC variables
  */
@@ -183,6 +199,16 @@ static bool pg_stat_log_enabled          = true;
 static int  pg_stat_log_min_elevel       = WARNING;
 static int  pg_stat_log_max              = PGSTAT_LOG_MAX_DEFAULT;
 static bool pg_stat_log_compute_query_id = false;
+static int  pg_stat_log_track_audit      = PGSTAT_LOG_TRACK_AUDIT_OFF;
+int         pg_stat_log_audit_max        = PGSTAT_LOG_AUDIT_MAX_DEFAULT;
+
+static const struct config_enum_entry track_audit_options[] = {
+    {"off",     PGSTAT_LOG_TRACK_AUDIT_OFF,     false},
+    {"command", PGSTAT_LOG_TRACK_AUDIT_COMMAND, false},
+    {"object",  PGSTAT_LOG_TRACK_AUDIT_OBJECT,  false},
+    {"on",      PGSTAT_LOG_TRACK_AUDIT_COMMAND, true },
+    {NULL,      0,                              false}
+};
 
 /*
  * Computed sizes (set in _PG_init based on pg_stat_log.max_entries)
@@ -233,6 +259,11 @@ pg_stat_log_errcode_name(int sqlerrcode)
     {
         if (pg_stat_log_lifecycle_codes[i].sqlerrcode == sqlerrcode)
             return pg_stat_log_lifecycle_codes[i].name;
+    }
+    for (int i = 0; i < lengthof(pg_stat_log_audit_codes); i++)
+    {
+        if (pg_stat_log_audit_codes[i].sqlerrcode == sqlerrcode)
+            return pg_stat_log_audit_codes[i].name;
     }
     for (int i = 0; pg_stat_log_errcodes[i].name != NULL; i++)
     {
@@ -360,6 +391,8 @@ pg_stat_log_shmem_startup(void)
         LWLockRegisterTranche(shmem->lock.tranche, PGSTAT_LOG_TRANCHE_NAME);
     }
 #endif
+
+    pg_stat_log_audit_shmem_startup();
 }
 
 /*
@@ -559,6 +592,40 @@ pg_stat_log_record_message(ErrorData *edata)
 }
 
 /*
+ * pg_stat_log_record_audit — count one pgaudit record
+ *
+ * pg_stat_log_audit groups records by login role, which log_line_prefix's
+ * %u prints next to them, and by the query identifier. pg_stat_log counts
+ * them like any other LOG message, under PSA01 or PSA02 and without a query
+ * identifier, whatever level pgaudit used.
+ */
+static void
+pg_stat_log_record_audit(const PgStatLogAuditRecord *record)
+{
+    Oid   userid;
+    int   sec_context;
+    int64 queryid = 0;
+
+    if (pg_stat_log_compute_query_id && IsQueryIdEnabled())
+        queryid = pgstat_get_my_query_id();
+
+    pg_stat_log_audit_count(record, MyBackendType, MyDatabaseId, MyProc->roleId, queryid);
+
+    if (LOG < pg_stat_log_min_elevel)
+        return;
+
+    GetUserIdAndSecContext(&userid, &sec_context);
+    pg_stat_log_count(MyBackendType,
+                      MyDatabaseId,
+                      userid,
+                      LOG,
+                      record->audit_type == PGSTAT_LOG_AUDIT_TYPE_OBJECT ?
+                          PGSTAT_LOG_ERRCODE_AUDIT_OBJECT :
+                          PGSTAT_LOG_ERRCODE_AUDIT_SESSION,
+                      0);
+}
+
+/*
  * pg_stat_log_log_reaches_server — would a LOG record reach the server log?
  *
  * Mirrors is_log_level_output() in elog.c; check-upstream-anchors.pl
@@ -647,7 +714,8 @@ pg_stat_log_startup_xact_cb(XactEvent event, void *arg)
  * emit_log_hook — intercept log messages for counting
  *
  * Always forwards to the previous hook in the chain. Only counts the
- * message if pg_stat_log is enabled and the severity meets the threshold.
+ * message if pg_stat_log is enabled and the severity meets the threshold,
+ * except for pgaudit records, which pg_stat_log.track_audit governs.
  */
 static void
 pg_stat_log_emit_hook(ErrorData *edata)
@@ -665,10 +733,25 @@ pg_stat_log_emit_hook(ErrorData *edata)
     in_emit_log_hook = true;
     PG_TRY();
     {
+        PgStatLogAuditRecord audit_record;
+        bool                 is_audit = false;
+
+        /*
+         * Read a pgaudit record before the previous hook runs: it may
+         * rewrite the message, as pgauditlogtofile does.
+         */
+        if (pg_stat_log_enabled && pg_stat_log_track_audit != PGSTAT_LOG_TRACK_AUDIT_OFF)
+            is_audit =
+                pg_stat_log_audit_parse(edata,
+                                        pg_stat_log_track_audit == PGSTAT_LOG_TRACK_AUDIT_OBJECT,
+                                        &audit_record);
+
         if (prev_emit_log_hook)
             prev_emit_log_hook(edata);
 
-        if (pg_stat_log_enabled && edata->elevel >= pg_stat_log_min_elevel)
+        if (is_audit)
+            pg_stat_log_record_audit(&audit_record);
+        else if (pg_stat_log_enabled && edata->elevel >= pg_stat_log_min_elevel)
             pg_stat_log_record_message(edata);
     }
     PG_FINALLY();
@@ -768,6 +851,33 @@ _PG_init(void)
                              NULL,
                              NULL);
 
+    DefineCustomEnumVariable("pg_stat_log.track_audit",
+                             "Tracks pgaudit audit records.",
+                             "command groups them by class and command, object also by "
+                             "object type and name.",
+                             &pg_stat_log_track_audit,
+                             PGSTAT_LOG_TRACK_AUDIT_OFF,
+                             track_audit_options,
+                             PGC_SIGHUP,
+                             0,
+                             NULL,
+                             NULL,
+                             NULL);
+
+    DefineCustomIntVariable("pg_stat_log.audit_max_entries",
+                            "Maximum number of distinct pgaudit record "
+                            "combinations to track.",
+                            NULL,
+                            &pg_stat_log_audit_max,
+                            PGSTAT_LOG_AUDIT_MAX_DEFAULT,
+                            PGSTAT_LOG_MIN_ENTRIES,
+                            PGSTAT_LOG_MAX_ENTRIES,
+                            PGC_POSTMASTER,
+                            0,
+                            NULL,
+                            NULL,
+                            NULL);
+
     MarkGUCPrefixReserved(PGSTAT_LOG_MODULE_NAME);
 
     /* Like pg_stat_statements; a no-op when compute_query_id is off */
@@ -799,6 +909,9 @@ _PG_init(void)
     }
 
     pgstat_register_kind(PGSTAT_KIND_LOG, &log_stats_kind);
+
+    /* Whatever pg_stat_log.track_audit is; see pg_stat_log_audit_register() */
+    pg_stat_log_audit_register();
 
     /*
      * Install shmem_startup_hook so every process registers the LWLock
