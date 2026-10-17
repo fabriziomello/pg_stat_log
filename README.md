@@ -28,13 +28,21 @@ The records written by `log_connections` and `log_disconnections` are counted
 under their own SQLSTATEs; see
 [Connection lifecycle records](#connection-lifecycle-records).
 
-The extension uses custom stats kind ID **28**, registered on the
+With `pg_stat_log.track_audit`, the audit records written by
+[pgaudit](https://github.com/pgaudit/pgaudit) are also counted by class,
+command and object, in the `pg_stat_log_audit` view; see
+[pgaudit records](#pgaudit-records).
+
+The extension uses custom stats kind IDs **28** and **31** (pgaudit records),
+registered on the
 [PostgreSQL wiki](https://wiki.postgresql.org/wiki/CustomCumulativeStats).
 
 ## Requirements
 
 - PostgreSQL 18 or later
 - Must be loaded via `shared_preload_libraries`
+- [pgaudit](https://github.com/pgaudit/pgaudit), only to count its audit
+  records
 
 ## Installation
 
@@ -65,14 +73,36 @@ Restart the server and create the extension:
 CREATE EXTENSION pg_stat_log;
 ```
 
+## Upgrading from 0.3
+
+Version 0.4 counts [pgaudit records](#pgaudit-records). Install the new
+version, restart the server so it loads the new library, then update the
+extension in each database where it is installed:
+
+```sql
+ALTER EXTENSION pg_stat_log UPDATE;
+```
+
+- **Statistics are kept.** The `pg_stat_log` counters are stored as in 0.3,
+  so they survive the restart; the pgaudit record counters start empty.
+- **The update only adds objects**, the `pg_stat_log_audit` view and its
+  functions. The `pg_stat_log` view and `pg_stat_log_data()` are unchanged.
+- **Going back to a 0.3 library discards all cumulative statistics.** The
+  statistics file written by 0.4 holds the pgaudit record counters, which 0.3
+  does not register: PostgreSQL logs a `could not find information of kind 31`
+  warning and `corrupted statistics file`, and starts over with every
+  cumulative statistic reset. The `pg_stat_log_audit` view and functions then
+  fail, as there is no update script back to 0.3.
+
 ## Upgrading from 0.1 or 0.2
 
 Version 0.3 adds the `query_id` column and counts
 [connection lifecycle records](#connection-lifecycle-records) under their own
 SQLSTATEs. Releases 0.1 and 0.2 both install the extension's SQL version 0.1
-(`pg_extension.extversion` shows `0.1`), so the update goes straight to 0.3.
-Install the new version, restart the server so it loads the new library, then
-update the extension in each database where it is installed:
+(`pg_extension.extversion` shows `0.1`), so the update goes straight to 0.3,
+and on to 0.4 (see [Upgrading from 0.3](#upgrading-from-03)). Install the new
+version, restart the server so it loads the new library, then update the
+extension in each database where it is installed:
 
 ```sql
 ALTER EXTENSION pg_stat_log UPDATE;
@@ -99,6 +129,8 @@ ALTER EXTENSION pg_stat_log UPDATE;
 | `pg_stat_log.min_error_level` | enum | `warning` | SUSET | Minimum severity to track (`debug5` through `panic`) |
 | `pg_stat_log.max_entries` | int | `1024` | POSTMASTER | Maximum distinct combinations to track; requires restart |
 | `pg_stat_log.compute_query_id` | bool | `off` | POSTMASTER | Also group by query identifier; see [Query identifiers](#query-identifiers) |
+| `pg_stat_log.track_audit` | enum | `off` | SIGHUP | Count pgaudit records (`off`, `command`, `object`); see [pgaudit records](#pgaudit-records) |
+| `pg_stat_log.audit_max_entries` | int | `1024` | POSTMASTER | Maximum distinct pgaudit record combinations to track; requires restart |
 
 ## Usage
 
@@ -278,6 +310,188 @@ ORDER BY l.count DESC;
   between statements, such as an `idle_session_timeout` FATAL, is counted
   under the identifier of the session's most recent statement.
 
+### pgaudit records
+
+[pgaudit](https://github.com/pgaudit/pgaudit) writes its audit records to the
+server log. With `pg_stat_log.track_audit`, pg_stat_log also counts them, in
+the `pg_stat_log_audit` view:
+
+```
+# postgresql.conf
+shared_preload_libraries = 'pgaudit, pg_stat_log'
+pg_stat_log.track_audit = object    # or command
+```
+
+For a role `app` audited with `pgaudit.log = 'read, write'` and
+`pgaudit.log_relation = on`, in a database with `pgaudit.role = 'auditor'`:
+
+```sql
+SELECT user_name, audit_type, class, command, object_type, object_name, count
+FROM pg_stat_log_audit
+ORDER BY count DESC;
+```
+
+```
+ user_name | audit_type | class | command | object_type |  object_name  | count
+-----------+------------+-------+---------+-------------+---------------+-------
+ app       | SESSION    | READ  | SELECT  | TABLE       | public.items  |     5
+ app       | SESSION    | WRITE | INSERT  | TABLE       | public.orders |     2
+ app       | OBJECT     | READ  | SELECT  | TABLE       | public.orders |     1
+ app       | SESSION    | READ  | SELECT  | TABLE       | public.orders |     1
+ app       | OBJECT     | WRITE | UPDATE  | TABLE       | public.orders |     1
+ app       | SESSION    | WRITE | UPDATE  | TABLE       | public.orders |     1
+```
+
+`pg_stat_log.track_audit` takes these values:
+
+- **`off`**, the default: records are not recognized. As before 0.4, they are
+  counted in `pg_stat_log` as ordinary `LOG` messages with SQLSTATE `00000`
+  if `pg_stat_log.min_error_level` is `log` or lower.
+- **`command`**, or `on`: records are grouped by backend type, database,
+  login role, query identifier, audit type, class and command.
+- **`object`**: also by object type and object name.
+
+It can only be set in the server configuration, so a session cannot turn it
+off. `pg_stat_log.min_error_level` does not apply to `pg_stat_log_audit`, but
+`pg_stat_log.enabled = off` stops counting there too.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `backend_type` | text | Process type (e.g. `client backend`) |
+| `database_oid` | oid | Database OID |
+| `database_name` | text | Resolved database name |
+| `user_oid` | oid | Login role OID |
+| `user_name` | text | Resolved login role name |
+| `query_id` | bigint | Query identifier of the top-level statement, NULL unless `pg_stat_log.compute_query_id` is on |
+| `audit_type` | text | `SESSION` or `OBJECT` |
+| `class` | text | `READ`, `WRITE`, `FUNCTION`, `ROLE`, `DDL` or `MISC` |
+| `command` | text | Command tag, such as `SELECT` or `CREATE TABLE` |
+| `object_type` | text | Object type, such as `TABLE`; NULL unless `track_audit = object` |
+| `object_name` | text | Object name as pgaudit writes it, such as `public."a,b"`, without its CSV quoting; NULL unless `track_audit = object` |
+| `count` | bigint | Cumulative record count |
+
+The object columns are also NULL for records that have no object, such as
+the session record of a `SELECT` or DML statement unless
+`pgaudit.log_relation` is on. DDL records have one only in databases where
+`CREATE EXTENSION pgaudit` was run, since pgaudit reads DDL objects from event
+triggers. Object names longer than 127 bytes and object types longer than 31
+are cut at a character boundary.
+
+**Load order.** If pgauditlogtofile is used, list pg_stat_log after it:
+
+```
+shared_preload_libraries = 'pgaudit, pgauditlogtofile, pg_stat_log'
+```
+
+The library listed last runs its `emit_log_hook` first. pgauditlogtofile
+moves the records from the server log to its own files and splits each one in
+place before passing it on. Listed after it, pg_stat_log reads every record
+before that, and counts it although it no longer reaches the server log.
+Listed before it, pg_stat_log only reads the audit type, so `class` and
+`command` are NULL.
+
+**Counts in `pg_stat_log`.** While `track_audit` is not `off`, records are
+counted in `pg_stat_log` under extension-defined SQLSTATEs instead of `00000`,
+if `pg_stat_log.min_error_level` is `log` or lower:
+
+| SQLSTATE | `sqlerrcode_name` | Records |
+|----------|-------------------|---------|
+| `PSA01` | `audit_session` | `SESSION` records |
+| `PSA02` | `audit_object` | `OBJECT` records |
+
+```sql
+SELECT user_name, elevel, sqlerrcode, sqlerrcode_name, count
+FROM pg_stat_log
+WHERE sqlerrcode LIKE 'PSA%';
+```
+
+```
+ user_name | elevel | sqlerrcode | sqlerrcode_name | count
+-----------+--------+------------+-----------------+-------
+ app       | LOG    | PSA01      | audit_session   |     9
+ app       | LOG    | PSA02      | audit_object    |     2
+```
+
+They take one entry per backend type, database, user and audit type: they are
+counted at `LOG` level, with a NULL `query_id` whatever
+`pg_stat_log.compute_query_id` is. The user is the current user, as for other
+messages, so DDL records, which pgaudit writes from its `SECURITY DEFINER`
+event trigger functions, are counted under the role that created the pgaudit
+extension.
+
+**Statements behind the records.** With `pg_stat_log.compute_query_id = on`,
+`pg_stat_statements` shows the statement of each query identifier. It
+attributes statements to the current user rather than the login role, so join
+on the query identifier and database:
+
+```sql
+SELECT a.audit_type, a.object_name, a.count, s.query
+FROM pg_stat_log_audit a
+LEFT JOIN LATERAL (
+    SELECT query
+    FROM pg_stat_statements s
+    WHERE s.queryid = a.query_id
+      AND s.dbid = a.database_oid
+      AND s.toplevel
+    LIMIT 1
+) s ON true
+WHERE a.query_id IS NOT NULL
+ORDER BY a.count DESC, a.object_name;
+```
+
+```
+ audit_type |  object_name  | count |                                query
+------------+---------------+-------+---------------------------------------------------------------------
+ SESSION    | public.items  |     4 | SELECT name FROM items WHERE id = $1
+ SESSION    | public.orders |     2 | INSERT INTO orders (item_id, qty) VALUES ($1, $2)
+ SESSION    | public.items  |     1 | SELECT i.name, o.qty FROM orders o JOIN items i ON i.id = o.item_id
+ SESSION    | public.orders |     1 | SELECT i.name, o.qty FROM orders o JOIN items i ON i.id = o.item_id
+ SESSION    | public.orders |     1 | UPDATE orders SET qty = $1 WHERE id = $2
+ OBJECT     | public.orders |     1 | UPDATE orders SET qty = $1 WHERE id = $2
+ OBJECT     | public.orders |     1 | SELECT i.name, o.qty FROM orders o JOIN items i ON i.id = o.item_id
+```
+
+Records of nested statements, such as those a function runs, are counted under
+the identifier of the top-level statement.
+
+- **Records are not statements.** One statement can produce several records:
+  a `SESSION` and an `OBJECT` record, one record per relation with
+  `pgaudit.log_relation`, and records for its substatements.
+- **Only the records pgaudit writes are counted.** pgaudit writes none for a
+  statement that fails before it runs, such as `SELECT 1/0`, whose division
+  the planner already evaluates. With `pgaudit.log_rows = on`, it writes
+  records when the statement ends, so a statement that fails has none.
+- **Records must reach the hook.** pgaudit writes them at `LOG` level for the
+  server log only, which reaches `emit_log_hook` unless `log_min_messages` is
+  `fatal` or `panic`. With `pgaudit.log_client = on` they are written at
+  `pgaudit.log_level` instead, and are not counted if it is below
+  `log_min_messages`, such as `notice` under the default `warning`; see
+  [Caveats](#caveats).
+- **The user is the login role**, the role that connected, as `%u` shows in
+  `log_line_prefix`, even after `SET ROLE` or inside a `SECURITY DEFINER`
+  function.
+- **A forged record is not counted.** Records are recognized by the pgaudit
+  function that writes them, so a `RAISE LOG 'AUDIT: ...'` is counted as an
+  ordinary message.
+- **A full table folds object rows.** Once `pg_stat_log.audit_max_entries`
+  combinations are tracked, a record with a new object is counted in the row
+  of its command without an object, if that row exists, and in `n_folded`.
+  Records that fit in no row are dropped and counted in `n_dropped`; see
+  [Inspecting capacity and drops](#inspecting-capacity-and-drops).
+- **`pg_read_all_stats` sees every database.** The view,
+  `pg_stat_log_audit_data()` and `pg_stat_log_audit_info()` are granted to
+  `pg_read_all_stats`, whose members see the object names audited in every
+  database, including objects they have no privileges on.
+  `pg_stat_log_audit_reset()` is superuser-only.
+- **Sizing.** Each entry takes 204 bytes of shared memory, about 209 kB for
+  the default 1024 entries, allocated even with `track_audit = off`: the
+  stats kind is always registered, since PostgreSQL discards a statistics file
+  that holds an unregistered kind. As for `max_entries`, changing
+  `audit_max_entries` discards all cumulative statistics. Size it as roughly
+  `N_databases x N_roles x audited_commands`, multiplied by the number of
+  audited objects with `object`, and by the number of audited statements with
+  `pg_stat_log.compute_query_id = on`.
+
 ### Resetting statistics
 
 ```sql
@@ -288,6 +502,13 @@ SELECT pg_stat_log_reset();
 Resetting also reclaims the tracked-combination slots, so new distinct
 combinations can be tracked after a reset even if `max_entries` had been
 reached previously.
+
+The [pgaudit record](#pgaudit-records) counters, which `pg_stat_log_reset()`
+leaves alone, have their own reset:
+
+```sql
+SELECT pg_stat_log_audit_reset();
+```
 
 ### Inspecting capacity and drops
 
@@ -315,13 +536,33 @@ workload: if it grows over time, increase `pg_stat_log.max_entries` (and
 restart) so every distinct combination fits. `stats_reset` advances
 whenever `pg_stat_log_reset()` is called.
 
+`pg_stat_log_audit_info()` reports the same for the
+[pgaudit record](#pgaudit-records) counters, sized by
+`pg_stat_log.audit_max_entries`:
+
+```sql
+SELECT * FROM pg_stat_log_audit_info();
+```
+
+```
+ max_entries | num_entries | n_folded | n_dropped |          stats_reset
+-------------+-------------+----------+-----------+-------------------------------
+        1024 |           6 |        0 |         0 | 2026-10-17 17:51:35.795986+00
+```
+
+`n_folded` counts the records with a new object that were counted in the row
+of their command because the table was full, and `n_dropped` the records
+that fit in no row. As for `pg_stat_log_info()`, these counters and
+`stats_reset` do not persist across restarts, and `stats_reset` advances
+whenever `pg_stat_log_audit_reset()` is called.
+
 ## How it works
 
 `pg_stat_log` uses the fixed-amount Custom Cumulative Stats API, following the
 same pattern as PostgreSQL's in-tree `test_custom_fixed_stats` test module.
 
-1. **Startup** (`_PG_init`): registers custom stats kind 28, defines GUCs,
-   and installs the `emit_log_hook`.
+1. **Startup** (`_PG_init`): registers custom stats kinds 28 and 31, defines
+   GUCs, and installs the `emit_log_hook`.
 
 2. **Hook** (`emit_log_hook`): on each log message at or above the configured
    minimum level, acquires a shared-memory LWLock, scans the entry array for a
@@ -351,6 +592,20 @@ same pattern as PostgreSQL's in-tree `test_custom_fixed_stats` test module.
    conditions that decide whether the record reaches the server log.
    `check-upstream-anchors.pl` verifies in CI that the PostgreSQL sources still
    match these assumptions.
+
+6. **pgaudit records**: the hook recognizes them by the source file and
+   function that write them, `pgaudit.c` and `log_audit_event()`, and by
+   their `AUDIT: ` prefix. It reads their fields before calling the previous
+   hook, which may rewrite the message. They are counted in custom stats kind
+   31, a second fixed-amount block with the same index-chained table as kind
+   28 and its own LWLock. pgaudit can write a record for every statement,
+   often under the same key, so a record whose key already has a row is
+   counted with an atomic increment while the lock is held in shared mode;
+   only adding a row, resetting and copying the table for a snapshot take it
+   exclusively. Kind 31 is registered whatever
+   `pg_stat_log.track_audit` is, so changing that setting never discards the
+   statistics file. `check-pgaudit-anchors.pl` verifies in CI that the pgaudit
+   sources still match these assumptions.
 
 ### Design notes: why a custom hash table
 
@@ -438,15 +693,20 @@ A few things to keep in mind when interpreting the counters:
 | File | Purpose |
 |------|---------|
 | `pg_stat_log.c` | C implementation (hook, callbacks, SQL functions) |
+| `pg_stat_log_audit.c` | pgaudit record parser, stats kind and SQL functions |
+| `pg_stat_log_audit.h` | Declarations shared by `pg_stat_log.c` and `pg_stat_log_audit.c` |
 | `pg_stat_log--0.1.sql` | SQL objects (functions, view) |
 | `pg_stat_log--0.1--0.3.sql` | Update to 0.3, adding the `query_id` column |
+| `pg_stat_log--0.3--0.4.sql` | Update to 0.4, adding the pgaudit record counters |
 | `pg_stat_log.control` | Extension metadata |
 | `Makefile` | PGXS build |
 | `generate-errcode-names.pl` | Generates SQLSTATE-to-name lookup header from `errcodes.txt` |
 | `check-upstream-anchors.pl` | Checks the PostgreSQL source assumptions behind the connection lifecycle counters and query identifiers |
+| `check-pgaudit-anchors.pl` | Checks the pgaudit source assumptions behind the pgaudit record counters |
 | `t/001_pg_stat_log.pl` | TAP regression tests |
 | `t/002_connection_lifecycle.pl` | TAP tests for the connection lifecycle counters |
 | `t/003_query_id.pl` | TAP tests for the query identifiers |
+| `t/004_pgaudit.pl` | TAP tests for the pgaudit record counters, skipped without pgaudit |
 
 ## License
 

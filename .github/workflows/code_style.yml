@@ -27,5 +27,5 @@ jobs:
       - name: Check code formatting
         if: always()
         run: |
-          clang-format -i pg_stat_log.c
+          clang-format -i pg_stat_log.c pg_stat_log_audit.c pg_stat_log_audit.h
           git diff --exit-code

@@ -1,9 +1,9 @@
 MODULE_big = pg_stat_log
 
 EXTENSION = pg_stat_log
-DATA = pg_stat_log--0.1.sql pg_stat_log--0.1--0.3.sql
+DATA = pg_stat_log--0.1.sql pg_stat_log--0.1--0.3.sql pg_stat_log--0.3--0.4.sql
 
-OBJS = pg_stat_log.o
+OBJS = pg_stat_log.o pg_stat_log_audit.o
 
 REGRESS_OPTS = --temp-instance=tmp_check --temp-config=pg_stat_log.conf
 REGRESS = pg_stat_log pg_stat_log_upgrade
@@ -29,9 +29,10 @@ pg_stat_log_errcodes.h: generate-errcode-names.pl
 	fi
 
 pg_stat_log.o: pg_stat_log_errcodes.h
+pg_stat_log.o pg_stat_log_audit.o: pg_stat_log_audit.h
 
 format:
-	clang-format -i pg_stat_log.c
+	clang-format -i pg_stat_log.c pg_stat_log_audit.c pg_stat_log_audit.h
 
 clean: clean-errcodes
 clean-errcodes:
