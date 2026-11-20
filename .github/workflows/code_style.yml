@@ -12,6 +12,8 @@ on:
       - '**.c'
       - '**.h'
       - '.clang-format'
+  workflow_dispatch:
+
 jobs:
   clang-format:
     name: Check code formatting
